@@ -2121,6 +2121,14 @@ and provider-declared mutating names, while everything else remains allowed
 by default. Risk reasons and sanitized arguments appear together in the existing
 approval dialog. #362 is closed pending extraction into a management plugin.
 
+The workspace/terminal lifecycle tools (`WorkspaceMcpToolProvider`: open_workspace,
+create_workspace, open_terminal, close_workspace and their aliases) are declared
+`readOnly = false`, so the ASK default above is their confirmation layer - the role the
+`DeepLinkOrigin` prompt plays for `boss://terminal?command=`. An operator "Always Allow"
+on `open_terminal` therefore runs later invocations unconfirmed, i.e. as strong as an
+unconfirmed external deep link; the command still passes the shape check and the shell
+risk evaluation (HIGH, CRITICAL for destructive patterns) on every call.
+
 ## Process log authority and lifetime
 
 Process logs are host-owned infrastructure, not an OS sandbox. Log setup fails closed

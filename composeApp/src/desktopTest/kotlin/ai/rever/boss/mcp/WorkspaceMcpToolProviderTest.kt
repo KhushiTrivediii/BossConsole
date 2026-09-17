@@ -42,7 +42,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-@Suppress("TooManyFunctions")
+@Suppress("TooManyFunctions", "LargeClass")
 class WorkspaceMcpToolProviderTest {
     private val tempDirs = mutableListOf<File>()
     private val createdSplitViewStates = mutableListOf<SplitViewState>()
@@ -230,7 +230,7 @@ class WorkspaceMcpToolProviderTest {
         }
 
     @Test
-    fun `create_workspace creates disposable workspace with unique ID`() =
+    fun `create_workspace creates disposable workspace with unique ID`(): Unit =
         runBlocking {
             val core = createTestCore()
 
@@ -296,7 +296,7 @@ class WorkspaceMcpToolProviderTest {
         }
 
     @Test
-    fun `open_terminal succeeds and emits TerminalOpenEvent with authoritative tab id`() =
+    fun `open_terminal returns the authoritative tab id without re-opening via the event bus`() =
         runBlocking {
             val core = createTestCore()
 
@@ -315,9 +315,20 @@ class WorkspaceMcpToolProviderTest {
                 expectedTab
             }
 
+            // The provider must not open terminals through the bus door: every window runs a
+            // collector on that bus that opens a terminal for each event aimed at it, so an
+            // emission here would open a second tab and run the command twice.
+            val busEvents = mutableListOf<String?>()
+            val collection =
+                launch {
+                    TerminalEventBus.terminalOpenEvents.collect { busEvents.add(it.sourceWindowId) }
+                }
+
             val validDir = workspaceDir.absolutePath.replace('\\', '/')
             val args = """{"workingDirectory":"$validDir","command":"echo hello"}"""
             val result = core.invoke("open_terminal", args)
+            delay(50L)
+            collection.cancel()
             assertFalse(result.isError, "Expected success: ${result.text}")
 
             val json = Json.parseToJsonElement(result.text).jsonObject
@@ -332,6 +343,7 @@ class WorkspaceMcpToolProviderTest {
 
             assertEquals("echo hello", openedCmd)
             assertEquals(validDir, openedCwd)
+            assertTrue(busEvents.isEmpty(), "open_terminal must not emit TerminalOpenEvents: $busEvents")
         }
 
     @Test
@@ -366,7 +378,7 @@ class WorkspaceMcpToolProviderTest {
         }
 
     @Test
-    fun `awaitSplitViewState waits for window registration on cold start`() =
+    fun `awaitSplitViewState waits for window registration on cold start`(): Unit =
         runBlocking {
             val tabReg = TabRegistry()
             val state = SplitViewState(tabReg, "window-async-ready")
@@ -434,15 +446,107 @@ class WorkspaceMcpToolProviderTest {
     fun `open_workspace rejects dangerous project or workspace paths`() =
         runBlocking {
             val core = createTestCore()
+            // projectPath is a destination (a terminal cwd), so it gets the strict gate:
+            // shell metacharacters and traversal are both refused.
             val badProjectArgs = """{"workspaceId":"test-ws","projectPath":"/tmp;rm -rf /"}"""
             val projectResult = core.invoke("open_workspace", badProjectArgs)
             assertTrue(projectResult.isError)
-            assertTrue(projectResult.text.contains("security check failed"))
+            assertTrue(projectResult.text.contains("Refusing to open"), projectResult.text)
 
-            val badFileArgs = """{"workspacePath":"/tmp/../etc/shadow"}"""
+            val badProjectTraversal = """{"workspaceId":"test-ws","projectPath":"/tmp/../etc"}"""
+            val traversalResult = core.invoke("open_workspace", badProjectTraversal)
+            assertTrue(traversalResult.isError)
+            assertTrue(traversalResult.text.contains("Refusing to open"), traversalResult.text)
+
+            // workspacePath is READ, so `..` is legal (it canonicalises); a NUL byte is not.
+            val badFileArgs = """{"workspacePath":"/etc/shadow\u0000.json"}"""
             val fileResult = core.invoke("open_workspace", badFileArgs)
             assertTrue(fileResult.isError)
             assertTrue(fileResult.text.contains("security check failed"))
+        }
+
+    @Test
+    fun `open_terminal opens exactly one terminal tab in a real window`() =
+        runBlocking {
+            val windowId = "open-terminal-real-window"
+            val state = SplitViewState(stubTabRegistry, windowId)
+            createdSplitViewStates.add(state)
+            SplitViewStateRegistry.register(windowId, state)
+
+            val busEvents = mutableListOf<String?>()
+            val collection =
+                launch {
+                    TerminalEventBus.terminalOpenEvents.collect { busEvents.add(it.sourceWindowId) }
+                }
+
+            val core = createTestCore()
+            val project = Files.createTempDirectory("open-terminal-cwd").toFile()
+            tempDirs.add(project)
+            val projectPath = project.absolutePath.replace('\\', '/')
+            val args = """{"windowId":"$windowId","workingDirectory":"$projectPath","command":"echo hello"}"""
+            val result = core.invoke("open_terminal", args)
+            delay(50L)
+            collection.cancel()
+
+            assertFalse(result.isError, result.text)
+            val json = Json.parseToJsonElement(result.text).jsonObject
+            val tabId = json["tabId"]!!.jsonPrimitive.content
+
+            // One terminal in the live tree, and the id returned is the one that is there.
+            val allTabs = state.getAllPanels().flatMap { it.tabsComponent.tabsState.value.tabs }
+            val terminalTabs = allTabs.filterIsInstance<TerminalTabInfo>()
+            assertEquals(1, terminalTabs.size, "exactly one terminal tab must exist: $allTabs")
+            assertEquals(tabId, terminalTabs.first().id)
+            // and no bus event aimed at the window, whose collector would open a second one.
+            assertTrue(
+                busEvents.none { it == windowId },
+                "no TerminalOpenEvent aimed at $windowId: $busEvents",
+            )
+        }
+
+    @Test
+    fun `open_workspace with createIfAbsent refuses reserved slot ids`() =
+        runBlocking {
+            val core = createTestCore()
+            val result =
+                core.invoke(
+                    "open_workspace",
+                    """{"workspaceId":"last-session","createIfAbsent":true,"name":"Hijack"}""",
+                )
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("reserved slot"), result.text)
+        }
+
+    @Test
+    fun `close_workspace on cold start does not create a window`() =
+        runBlocking {
+            val core = createTestCore()
+
+            val createResult = core.invoke("create_workspace", """{"isDisposable":true}""")
+            val wsId =
+                Json
+                    .parseToJsonElement(createResult.text)
+                    .jsonObject["workspaceId"]!!
+                    .jsonPrimitive.content
+            // The create call awaited its disk write, so the file must exist now.
+            assertNotNull(fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId(wsId)))
+
+            // Zero registered windows: closing must not mint one, but still cleans the file.
+            val closeResult = core.invoke("close_workspace", """{"workspaceId":"$wsId"}""")
+            assertFalse(closeResult.isError, closeResult.text)
+            assertEquals(0, windowCreatorCalls, "closing a workspace must never create a window")
+            val json = Json.parseToJsonElement(closeResult.text).jsonObject
+            assertTrue(json["fileDeleted"]?.jsonPrimitive?.booleanOrNull == true)
+            assertTrue(fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId(wsId)) == null)
+        }
+
+    @Test
+    fun `close_workspace errors when nothing is released and nothing is deleted`() =
+        runBlocking {
+            val core = createTestCore()
+            val result = core.invoke("close_workspace", """{"workspaceId":"no-such-space"}""")
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("nothing was closed"), result.text)
         }
 
     // ------------------------------------------------------------------
@@ -466,7 +570,7 @@ class WorkspaceMcpToolProviderTest {
         }
 
     @Test
-    fun `open_workspace path mode opens a project directory and returns usable ids`() =
+    fun `open_workspace path mode opens a project directory and returns usable ids`(): Unit =
         runBlocking {
             val windowId = "ws-path-mode-window"
             val state = SplitViewState(stubTabRegistry, windowId)
@@ -487,7 +591,18 @@ class WorkspaceMcpToolProviderTest {
             val json = Json.parseToJsonElement(result.text).jsonObject
             assertEquals("opened", json["status"]?.jsonPrimitive?.content)
             assertEquals(windowId, json["windowId"]?.jsonPrimitive?.content)
-            assertEquals("panel-open-workspace", json["panelId"]?.jsonPrimitive?.content)
+
+            // The panel id must address a LIVE panel: applyWorkspace throws the saved layout's
+            // panel ids away and builds into the panel at "main", so the saved id
+            // (BOOTSTRAP_PANEL_ID) does not exist on screen.
+            val wsId = json["workspaceId"]!!.jsonPrimitive.content
+            val panelId = json["panelId"]!!.jsonPrimitive.content
+            assertEquals(state.activePanelIdForWorkspace(wsId), panelId)
+            val liveTabs = state.getPanelTabsComponent(panelId)
+            assertNotNull(liveTabs, "panelId must resolve in the live tree")
+            val tabs = liveTabs.tabsState.value.tabs
+            val liveTerminalTabs = tabs.filterIsInstance<TerminalTabInfo>()
+            assertEquals(1, liveTerminalTabs.size, "the bootstrap Space has one terminal tab")
             assertEquals(project.canonicalPath, json["projectPath"]?.jsonPrimitive?.content)
             assertNotNull(json["workspaceId"]?.jsonPrimitive?.content)
             assertNotNull(json["workspaceName"]?.jsonPrimitive?.content)
@@ -716,7 +831,7 @@ class WorkspaceMcpToolProviderTest {
         }
 
     @Test
-    fun `close_workspace does not delete a saved workspace whose id contains disposable`() =
+    fun `close_workspace does not delete a saved workspace whose id contains disposable`(): Unit =
         runBlocking {
             val core = createTestCore()
             val createResult =
@@ -727,10 +842,11 @@ class WorkspaceMcpToolProviderTest {
             assertFalse(createResult.isError, createResult.text)
             assertNotNull(fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId("disposable-env")))
 
+            // Nothing is released and nothing is deleted, so the tool says so instead of
+            // reporting a success that would leave the agent thinking the space is gone.
             val closeResult = core.invoke("close_workspace", """{"workspaceId":"disposable-env"}""")
-            assertFalse(closeResult.isError, closeResult.text)
-            val json = Json.parseToJsonElement(closeResult.text).jsonObject
-            assertTrue(json["fileDeleted"]?.jsonPrimitive?.booleanOrNull == false, closeResult.text)
+            assertTrue(closeResult.isError, closeResult.text)
+            assertTrue(closeResult.text.contains("nothing was closed"), closeResult.text)
 
             // A user's saved Space whose id merely contains "disposable" survives.
             assertNotNull(fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId("disposable-env")))
