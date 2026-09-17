@@ -1,5 +1,6 @@
 package ai.rever.boss.mcp
 
+import ai.rever.boss.cli.CLISecurityValidator
 import ai.rever.boss.components.events.TerminalEventBus
 import ai.rever.boss.components.events.WorkspaceEventBus
 import ai.rever.boss.components.window_panel.SplitViewState
@@ -354,6 +355,13 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         val createIfAbsent = args.boolean("createIfAbsent") ?: false
         val openTerminal = args.boolean("openTerminal") ?: false
 
+        if (!workspacePath.isNullOrBlank() && !CLISecurityValidator.isValidPath(workspacePath)) {
+            return McpToolResult("Invalid workspace path (security check failed)", isError = true)
+        }
+        if (!projectPath.isNullOrBlank() && !CLISecurityValidator.isValidPath(projectPath)) {
+            return McpToolResult("Invalid project path (security check failed)", isError = true)
+        }
+
         val targetResolution = resolveTargetWindow(requestedWindowId)
         val targetWindowId =
             when (targetResolution) {
@@ -469,6 +477,10 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         val isDisposable = args.boolean("isDisposable") ?: false
         val openTerminal = args.boolean("openTerminal") ?: false
 
+        if (!projectPath.isNullOrBlank() && !CLISecurityValidator.isValidPath(projectPath)) {
+            return McpToolResult("Invalid project path (security check failed)", isError = true)
+        }
+
         val id =
             if (isDisposable) {
                 "workspace-disposable-${System.currentTimeMillis()}-${Random.nextInt(1000, 9999)}"
@@ -509,8 +521,18 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         val workingDirectory = args.string("workingDirectory")
         val command = args.string("command")
 
+        if (!command.isNullOrBlank() && !CLISecurityValidator.isValidCommand(command)) {
+            return McpToolResult("Invalid command format (security check failed)", isError = true)
+        }
+
         // Validate working directory if specified
         if (!workingDirectory.isNullOrBlank()) {
+            if (!CLISecurityValidator.isValidPath(workingDirectory)) {
+                return McpToolResult(
+                    "Invalid working directory path (security check failed)",
+                    isError = true,
+                )
+            }
             val dir = File(workingDirectory)
             if (!dir.exists() || !dir.isDirectory) {
                 return McpToolResult(
