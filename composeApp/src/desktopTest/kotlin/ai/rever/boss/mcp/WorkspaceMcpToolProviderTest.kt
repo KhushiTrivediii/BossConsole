@@ -391,4 +391,39 @@ class WorkspaceMcpToolProviderTest {
             val loadedAfterClose = fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId(wsId))
             assertTrue(loadedAfterClose == null)
         }
+
+    @Test
+    fun `open_terminal rejects command with newlines or control characters`() =
+        runBlocking {
+            val core = createTestCore()
+            val args = """{"command":"echo hello\nrm -rf /"}"""
+            val result = core.invoke("open_terminal", args)
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("security check failed"))
+        }
+
+    @Test
+    fun `open_terminal rejects dangerous working directory paths`() =
+        runBlocking {
+            val core = createTestCore()
+            val args = """{"workingDirectory":"/tmp/../etc/passwd"}"""
+            val result = core.invoke("open_terminal", args)
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("security check failed"))
+        }
+
+    @Test
+    fun `open_workspace rejects dangerous project or workspace paths`() =
+        runBlocking {
+            val core = createTestCore()
+            val badProjectArgs = """{"workspaceId":"test-ws","projectPath":"/tmp;rm -rf /"}"""
+            val projectResult = core.invoke("open_workspace", badProjectArgs)
+            assertTrue(projectResult.isError)
+            assertTrue(projectResult.text.contains("security check failed"))
+
+            val badFileArgs = """{"workspacePath":"/tmp/../etc/shadow"}"""
+            val fileResult = core.invoke("open_workspace", badFileArgs)
+            assertTrue(fileResult.isError)
+            assertTrue(fileResult.text.contains("security check failed"))
+        }
 }
