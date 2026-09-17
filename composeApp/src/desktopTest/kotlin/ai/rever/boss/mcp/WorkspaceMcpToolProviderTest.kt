@@ -8,9 +8,19 @@ import ai.rever.boss.components.workspaces.LayoutWorkspace
 import ai.rever.boss.components.workspaces.PredefinedWorkspaces
 import ai.rever.boss.components.workspaces.WorkspaceFileManager
 import ai.rever.boss.components.workspaces.WorkspaceFileManagerCommon
+import ai.rever.boss.components.workspaces.extractCurrentWorkspace
 import ai.rever.boss.plugin.api.McpToolResult
+import ai.rever.boss.plugin.api.TabComponentWithUI
+import ai.rever.boss.plugin.api.TabInfo
 import ai.rever.boss.plugin.api.TabRegistry
+import ai.rever.boss.plugin.api.TabTypeInfo
 import ai.rever.boss.plugin.tab.terminal.TerminalTabInfo
+import ai.rever.boss.plugin.tab.terminal.TerminalTabType
+import ai.rever.boss.plugin.workspace.PanelConfig
+import ai.rever.boss.plugin.workspace.SplitConfig
+import ai.rever.boss.plugin.workspace.TabConfig
+import androidx.compose.runtime.Composable
+import com.arkivanov.decompose.ComponentContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -29,12 +39,14 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @Suppress("TooManyFunctions")
 class WorkspaceMcpToolProviderTest {
     private val tempDirs = mutableListOf<File>()
     private val createdSplitViewStates = mutableListOf<SplitViewState>()
+    private var windowCreatorCalls = 0
     private lateinit var workspaceDir: File
     private lateinit var fileManager: WorkspaceFileManager
 
@@ -45,7 +57,11 @@ class WorkspaceMcpToolProviderTest {
         workspaceDir = dir
         fileManager = WorkspaceFileManager(directoryOverride = dir.absolutePath)
         WorkspaceMcpToolProvider.fileManagerProvider = { fileManager }
-        WorkspaceMcpToolProvider.windowCreator = { "test-window-window-1" }
+        WorkspaceMcpToolProvider.windowCreator = {
+            windowCreatorCalls++
+            "test-window-window-1"
+        }
+        windowCreatorCalls = 0
         WorkspaceMcpToolProvider.splitViewStateResolver = { null }
         WorkspaceMcpToolProvider.terminalTabOpener = null
         WorkspaceMcpToolProvider.splitViewWaitTimeoutMs = 50L
@@ -132,7 +148,7 @@ class WorkspaceMcpToolProviderTest {
     }
 
     @Test
-    fun `list_workspaces returns predefined templates and active state`() =
+    fun `list_workspaces is a pure read even when no window is open`() =
         runBlocking {
             val core = createTestCore()
 
@@ -141,7 +157,9 @@ class WorkspaceMcpToolProviderTest {
 
             val json = Json.parseToJsonElement(result.text).jsonObject
             assertTrue(json["success"]?.jsonPrimitive?.booleanOrNull == true)
-            assertEquals("test-window-window-1", json["activeWindowId"]?.jsonPrimitive?.content)
+            // A read-only tool must not create a window just to answer a listing.
+            assertEquals(null, json["activeWindowId"])
+            assertEquals(0, windowCreatorCalls, "list_workspaces must not create a window")
 
             val workspaces = json["workspaces"]?.jsonArray
             assertNotNull(workspaces)
@@ -426,4 +444,309 @@ class WorkspaceMcpToolProviderTest {
             assertTrue(fileResult.isError)
             assertTrue(fileResult.text.contains("security check failed"))
         }
+
+    // ------------------------------------------------------------------
+    // open_workspace path mode (bootstrap consolidated from #799)
+    // ------------------------------------------------------------------
+
+    /** Minimal stand-in; the applier only builds TabInfo, it never renders the component. */
+    private class StubTabComponent(
+        ctx: ComponentContext,
+        override val config: TabInfo,
+        override val tabTypeInfo: TabTypeInfo,
+    ) : TabComponentWithUI,
+        ComponentContext by ctx {
+        @Composable
+        override fun Content() = Unit
+    }
+
+    private val stubTabRegistry =
+        TabRegistry().apply {
+            registerTabType(TerminalTabType) { config, ctx -> StubTabComponent(ctx, config, TerminalTabType) }
+        }
+
+    @Test
+    fun `open_workspace path mode opens a project directory and returns usable ids`() =
+        runBlocking {
+            val windowId = "ws-path-mode-window"
+            val state = SplitViewState(stubTabRegistry, windowId)
+            createdSplitViewStates.add(state)
+            SplitViewStateRegistry.register(windowId, state)
+
+            val project = Files.createTempDirectory("ws-path-mode-project").toFile()
+            tempDirs.add(project)
+
+            val core = createTestCore()
+            val result =
+                core.invoke(
+                    "open_workspace",
+                    """{"path":"${project.absolutePath.replace('\\', '/')}","windowId":"$windowId"}""",
+                )
+            assertFalse(result.isError, result.text)
+
+            val json = Json.parseToJsonElement(result.text).jsonObject
+            assertEquals("opened", json["status"]?.jsonPrimitive?.content)
+            assertEquals(windowId, json["windowId"]?.jsonPrimitive?.content)
+            assertEquals("panel-open-workspace", json["panelId"]?.jsonPrimitive?.content)
+            assertEquals(project.canonicalPath, json["projectPath"]?.jsonPrimitive?.content)
+            assertNotNull(json["workspaceId"]?.jsonPrimitive?.content)
+            assertNotNull(json["workspaceName"]?.jsonPrimitive?.content)
+        }
+
+    @Test
+    fun `open_workspace path mode re-enters the running Space instead of duplicating it`() =
+        runBlocking {
+            val windowId = "ws-path-reenter-window"
+            val state = SplitViewState(stubTabRegistry, windowId)
+            createdSplitViewStates.add(state)
+            SplitViewStateRegistry.register(windowId, state)
+
+            val project = Files.createTempDirectory("ws-path-reenter-project").toFile()
+            tempDirs.add(project)
+            val projectPath = project.absolutePath.replace('\\', '/')
+
+            val core = createTestCore()
+            val first = core.invoke("open_workspace", """{"path":"$projectPath"}""")
+            assertFalse(first.isError, first.text)
+            val firstId =
+                Json
+                    .parseToJsonElement(first.text)
+                    .jsonObject["workspaceId"]!!
+                    .jsonPrimitive.content
+
+            val second = core.invoke("open_workspace", """{"path":"$projectPath"}""")
+            assertFalse(second.isError, second.text)
+            val payload = Json.parseToJsonElement(second.text).jsonObject
+            assertEquals("reused", payload["status"]?.jsonPrimitive?.content)
+            assertEquals(firstId, payload["workspaceId"]?.jsonPrimitive?.content)
+
+            // and the panel did not grow a second terminal for the same project
+            val onScreen = extractCurrentWorkspace(state, projectPath = project.canonicalPath)
+            assertEquals(1, (onScreen.layout as SplitConfig.SinglePanel).panel.tabs.size)
+        }
+
+    @Test
+    fun `open_workspace path mode refuses a relative path`() =
+        runBlocking {
+            val core = createTestCore()
+            val result = core.invoke("open_workspace", """{"path":"some/relative/dir"}""")
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("absolute"), result.text)
+        }
+
+    @Test
+    fun `open_workspace path mode is a clear error for a missing directory`() =
+        runBlocking {
+            val core = createTestCore()
+            val missing = File(workspaceDir, "no-such-directory").absolutePath.replace('\\', '/')
+            val result = core.invoke("open_workspace", """{"path":"$missing"}""")
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("not an existing directory"), result.text)
+        }
+
+    @Test
+    fun `open_workspace path mode rejects a file as a project directory`() =
+        runBlocking {
+            val core = createTestCore()
+            val file = File(workspaceDir, "plain-file.txt").apply { writeText("content") }
+            val result = core.invoke("open_workspace", """{"path":"${file.absolutePath.replace('\\', '/')}"}""")
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("not an existing directory"), result.text)
+        }
+
+    @Test
+    fun `open_workspace path mode rejects shell-shaped and traversal paths`() =
+        runBlocking {
+            val core = createTestCore()
+
+            // A real directory whose name contains a shell metacharacter is still refused.
+            val semicolonDir = File(workspaceDir, "proj;ect").apply { mkdirs() }
+            val result = core.invoke("open_workspace", """{"path":"${semicolonDir.absolutePath.replace('\\', '/')}"}""")
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("Refusing to open"), result.text)
+
+            // A traversal path that resolves to an existing directory is refused the same way.
+            File(workspaceDir, "traversal-parent").mkdirs()
+            val child = File(workspaceDir, "traversal-parent/traversal-child").apply { mkdirs() }
+            val traversal = "${child.absolutePath}/../traversal-child".replace('\\', '/')
+            val traversalResult = core.invoke("open_workspace", """{"path":"$traversal"}""")
+            assertTrue(traversalResult.isError)
+            assertTrue(traversalResult.text.contains("Refusing to open"), traversalResult.text)
+        }
+
+    @Test
+    fun `open_workspace path mode lists open windows for an unknown window id`() =
+        runBlocking {
+            val state = SplitViewState(stubTabRegistry, "ws-unknown-window")
+            createdSplitViewStates.add(state)
+            SplitViewStateRegistry.register("ws-unknown-window", state)
+
+            val project = Files.createTempDirectory("ws-path-unknown-window").toFile()
+            tempDirs.add(project)
+
+            val core = createTestCore()
+            val result =
+                core.invoke(
+                    "open_workspace",
+                    """{"path":"${project.absolutePath.replace('\\', '/')}","windowId":"no-such-window"}""",
+                )
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("not registered or has been closed"), result.text)
+            assertTrue(result.text.contains("ws-unknown-window"), result.text)
+        }
+
+    @Test
+    fun `open_workspace path mode errors when no window is available`() =
+        runBlocking {
+            WorkspaceMcpToolProvider.windowCreator = null
+
+            val project = Files.createTempDirectory("ws-path-nowindow").toFile()
+            tempDirs.add(project)
+
+            val core = createTestCore()
+            val result = core.invoke("open_workspace", """{"path":"${project.absolutePath.replace('\\', '/')}"}""")
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("No active windows exist"), result.text)
+        }
+
+    @Test
+    fun `open_workspace refuses path together with a workspace selector`() =
+        runBlocking {
+            val core = createTestCore()
+            val project = Files.createTempDirectory("ws-path-exclusive").toFile()
+            tempDirs.add(project)
+            val mutualExclusionArgs =
+                """{"path":"${project.absolutePath.replace('\\', '/')}",""" +
+                    """"workspaceId":"${PredefinedWorkspaces.DUAL_TERMINAL_ID}"}"""
+            val result = core.invoke("open_workspace", mutualExclusionArgs)
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("not both"), result.text)
+        }
+
+    @Test
+    fun `tilde expands to the home directory only at the start of a path`() {
+        assertEquals("/home/boss/projects", expandTilde("~/projects", home = "/home/boss"))
+        assertEquals("/home/boss", expandTilde("~", home = "/home/boss"))
+        assertEquals("/opt/~literal/projects", expandTilde("/opt/~literal/projects", home = "/home/boss"))
+        assertEquals("~/unchanged", expandTilde("~/unchanged", home = null))
+    }
+
+    @Test
+    fun `bootstrap space is one terminal panel named for the project`() {
+        val space = buildBootstrapSpace("/work/some-project")
+
+        assertEquals("some-project", space.name)
+        assertEquals("/work/some-project", space.projectPath)
+        val panel = (space.layout as SplitConfig.SinglePanel).panel
+        assertEquals(WorkspaceMcpToolProvider.BOOTSTRAP_PANEL_ID, panel.id)
+        val tab = panel.tabs.single()
+        assertEquals("terminal", tab.type)
+        assertEquals("/work/some-project", tab.workingDirectory)
+    }
+
+    @Test
+    fun `matchExistingSpace prefers a running space over a non-running one`() {
+        val running = savedSpaceFixture("workspace-running", "/work/p")
+        val shelved = savedSpaceFixture("workspace-shelved", "/work/p")
+
+        val match =
+            matchExistingSpace(
+                remembered = null,
+                savedSpaces = listOf(shelved, running),
+                runningIdsInWindow = setOf("workspace-running"),
+                projectPath = "/work/p",
+            )
+
+        assertEquals("workspace-running", match?.id)
+    }
+
+    @Test
+    fun `matchExistingSpace never matches spaces for other projects`() {
+        val other = savedSpaceFixture("workspace-other", "/work/other")
+
+        assertNull(
+            matchExistingSpace(
+                remembered = null,
+                savedSpaces = listOf(other),
+                runningIdsInWindow = setOf("workspace-other"),
+                projectPath = "/work/p",
+            ),
+        )
+    }
+
+    @Test
+    fun `matchExistingSpace reuses a remembered space even when it is not running`() {
+        val remembered = buildBootstrapSpace("/work/p")
+
+        val match =
+            matchExistingSpace(
+                remembered = remembered,
+                savedSpaces = emptyList(),
+                runningIdsInWindow = emptySet(),
+                projectPath = "/work/p",
+            )
+
+        assertEquals(remembered.id, match?.id)
+    }
+
+    @Test
+    fun `close_workspace releases a running workspace from the target window`() =
+        runBlocking {
+            val windowId = "ws-close-release-window"
+            val state = SplitViewState(stubTabRegistry, windowId)
+            createdSplitViewStates.add(state)
+            SplitViewStateRegistry.register(windowId, state)
+
+            val core = createTestCore()
+            val openResult =
+                core.invoke(
+                    "open_workspace",
+                    """{"workspaceId":"${PredefinedWorkspaces.DUAL_TERMINAL_ID}","windowId":"$windowId"}""",
+                )
+            assertFalse(openResult.isError, openResult.text)
+
+            val closeResult =
+                core.invoke(
+                    "close_workspace",
+                    """{"workspaceId":"${PredefinedWorkspaces.DUAL_TERMINAL_ID}","windowId":"$windowId"}""",
+                )
+            assertFalse(closeResult.isError, closeResult.text)
+            val json = Json.parseToJsonElement(closeResult.text).jsonObject
+            assertTrue(json["releasedHere"]?.jsonPrimitive?.booleanOrNull == true, closeResult.text)
+        }
+
+    @Test
+    fun `close_workspace does not delete a saved workspace whose id contains disposable`() =
+        runBlocking {
+            val core = createTestCore()
+            val createResult =
+                core.invoke(
+                    "open_workspace",
+                    """{"workspaceId":"disposable-env","name":"Env","createIfAbsent":true}""",
+                )
+            assertFalse(createResult.isError, createResult.text)
+            assertNotNull(fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId("disposable-env")))
+
+            val closeResult = core.invoke("close_workspace", """{"workspaceId":"disposable-env"}""")
+            assertFalse(closeResult.isError, closeResult.text)
+            val json = Json.parseToJsonElement(closeResult.text).jsonObject
+            assertTrue(json["fileDeleted"]?.jsonPrimitive?.booleanOrNull == false, closeResult.text)
+
+            // A user's saved Space whose id merely contains "disposable" survives.
+            assertNotNull(fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId("disposable-env")))
+        }
+
+    private fun savedSpaceFixture(
+        id: String,
+        projectPath: String,
+    ) = LayoutWorkspace(
+        id = id,
+        name = id,
+        description = "",
+        layout =
+            SplitConfig.SinglePanel(
+                PanelConfig(id = "panel-$id", tabs = listOf(TabConfig(type = "terminal", title = "Terminal"))),
+            ),
+        projectPath = projectPath,
+    )
 }

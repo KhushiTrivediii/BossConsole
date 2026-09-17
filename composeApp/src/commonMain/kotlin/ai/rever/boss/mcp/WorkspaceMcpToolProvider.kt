@@ -13,17 +13,21 @@ import ai.rever.boss.components.workspaces.WorkspaceFileManager
 import ai.rever.boss.components.workspaces.WorkspaceFileManagerCommon
 import ai.rever.boss.components.workspaces.WorkspaceSerializer
 import ai.rever.boss.components.workspaces.applyWorkspace
+import ai.rever.boss.components.workspaces.extractPanels
+import ai.rever.boss.components.workspaces.workspaceManager
 import ai.rever.boss.plugin.api.McpToolArgs
 import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolHandler
 import ai.rever.boss.plugin.api.McpToolProvider
 import ai.rever.boss.plugin.api.McpToolResult
 import ai.rever.boss.plugin.tab.terminal.TerminalTabInfo
+import ai.rever.boss.plugin.tab.terminal.TerminalTabType
 import ai.rever.boss.plugin.workspace.SplitConfig.SinglePanel
 import ai.rever.boss.project.DefaultWorkingDirectory
-import ai.rever.boss.utils.WindowFocusManager
+import ai.rever.boss.utils.extractFileName
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
+import ai.rever.boss.window.WindowProjectState
 import ai.rever.boss.window.WindowProjectStateRegistry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.filter
@@ -38,7 +42,9 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
+import kotlin.time.Clock
 
 /**
  * Host MCP tool provider exposing workspace and terminal lifecycle operations.
@@ -53,9 +59,25 @@ import kotlin.random.Random
  * - open_terminal / terminal_open
  * - close_workspace / workspace_close
  */
-@Suppress("TooManyFunctions")
+// One cohesive MCP tool provider; handlers stay beside their tool definitions.
+@Suppress("TooManyFunctions", "LargeClass")
 object WorkspaceMcpToolProvider : McpToolProvider {
     private val logger = BossLogger.forComponent("WorkspaceMcpToolProvider")
+
+    /** Panel id of the terminal panel the bootstrap Space builds. */
+    const val BOOTSTRAP_PANEL_ID = "panel-open-workspace"
+
+    /** Id prefix of disposable workspaces minted by this tool; only these may be file-deleted. */
+    internal const val DISPOSABLE_ID_PREFIX = "workspace-disposable-"
+
+    /**
+     * Bootstrap Spaces this tool created, by window then by canonical project path, so a second
+     * open of the same project re-enters the Space instead of minting a second one for the same
+     * directory. The manager's windowWorkspaces map covers saved Spaces, but an unsaved bootstrap
+     * Space is not in the manager's list, so the tool remembers its own (matching rules
+     * consolidated from #799).
+     */
+    internal val createdSpaces = ConcurrentHashMap<String, ConcurrentHashMap<String, LayoutWorkspace>>()
 
     override val providerId: String = "boss-workspace"
 
@@ -111,8 +133,15 @@ object WorkspaceMcpToolProvider : McpToolProvider {
             return if (isRegistered) {
                 TargetWindowResolution.Success(requestedWindowId)
             } else {
+                val openIds =
+                    SplitViewStateRegistry
+                        .getAllStates()
+                        .keys
+                        .joinToString(", ")
+                        .ifEmpty { "(none)" }
                 TargetWindowResolution.Failure(
-                    "Target window '$requestedWindowId' is not registered or has been closed",
+                    "Target window '$requestedWindowId' is not registered or has been closed. " +
+                        "Open windows: $openIds",
                 )
             }
         }
@@ -174,29 +203,36 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         )
 
     private fun createOpenWorkspaceTool(name: String): McpToolDefinition =
-        McpToolDefinition(
+        McpToolDefinition.withRbac(
             name = name,
-            description = "Open an existing workspace or create one if absent, targeting a window.",
+            description =
+                "Open a workspace in a window: either 'path' to open a project directory as a new " +
+                    "Space with its first terminal (bootstrap; re-opening a running path re-enters " +
+                    "the Space instead of duplicating it), or an existing workspace by " +
+                    "'workspaceId' / 'workspacePath', optionally created via 'name' / 'projectPath' " +
+                    "with 'createIfAbsent'.",
             inputSchema =
                 """
                 {
                     "type": "object",
                     "properties": {
+                        "path": { "type": "string", "description": "Absolute path of an existing project directory to open as a new Space with its first terminal. A leading ~ is expanded; relative paths are refused." },
                         "workspaceId": { "type": "string", "description": "ID of the workspace to open" },
                         "workspacePath": { "type": "string", "description": "Path to workspace JSON file" },
                         "name": { "type": "string", "description": "Name if creating workspace" },
                         "projectPath": { "type": "string", "description": "Project root directory" },
                         "windowId": { "type": "string", "description": "Target window ID" },
                         "createIfAbsent": { "type": "boolean", "description": "Create workspace if not found" },
-                        "openTerminal": { "type": "boolean", "description": "Automatically open a terminal tab" }
+                        "openTerminal": { "type": "boolean", "description": "Automatically open a terminal tab (workspace-id modes; the path bootstrap already includes its first terminal)" }
                     }
                 }
                 """.trimIndent(),
             handler = McpToolHandler { args -> handleOpenWorkspace(args) },
+            readOnly = false,
         )
 
     private fun createCreateWorkspaceTool(name: String): McpToolDefinition =
-        McpToolDefinition(
+        McpToolDefinition.withRbac(
             name = name,
             description =
                 "Create and persist a new workspace configuration (optionally disposable) without activating it.",
@@ -219,6 +255,7 @@ object WorkspaceMcpToolProvider : McpToolProvider {
                 }
                 """.trimIndent(),
             handler = McpToolHandler { args -> handleCreateWorkspace(args) },
+            readOnly = false,
         )
 
     private fun createOpenTerminalTool(name: String): McpToolDefinition =
@@ -238,12 +275,15 @@ object WorkspaceMcpToolProvider : McpToolProvider {
                 }
                 """.trimIndent(),
             handler = McpToolHandler { args -> handleOpenTerminal(args) },
+            readOnly = false,
         )
 
     private fun createCloseWorkspaceTool(name: String): McpToolDefinition =
         McpToolDefinition(
             name = name,
-            description = "Close a workspace or release its layout in the target window.",
+            description =
+                "Stop a workspace running in a window (clearing its tabs), and delete the file of a " +
+                    "disposable workspace this tool created.",
             inputSchema =
                 """
                 {
@@ -256,6 +296,7 @@ object WorkspaceMcpToolProvider : McpToolProvider {
                 }
                 """.trimIndent(),
             handler = McpToolHandler { args -> handleCloseWorkspace(args) },
+            readOnly = false,
         )
 
     // =========================================================================
@@ -269,14 +310,9 @@ object WorkspaceMcpToolProvider : McpToolProvider {
             if (!windowId.isNullOrBlank()) {
                 windowId
             } else {
-                val registered = SplitViewStateRegistry.getAllStates()
-                if (registered.size == 1) {
-                    registered.keys.first()
-                } else if (registered.isEmpty()) {
-                    windowCreator?.invoke()
-                } else {
-                    null
-                }
+                // Read-only: a listing must not create a window. With exactly one registered
+                // window it is the only possible target; otherwise report none.
+                SplitViewStateRegistry.getAllStates().keys.singleOrNull()
             }
         val splitViewState =
             targetWindowId?.let {
@@ -337,8 +373,12 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         val response =
             buildJsonObject {
                 put("success", true)
-                put("activeWindowId", targetWindowId)
-                put("activeWorkspaceId", activeWorkspaceId)
+                if (targetWindowId != null) {
+                    put("activeWindowId", targetWindowId)
+                }
+                if (activeWorkspaceId != null) {
+                    put("activeWorkspaceId", activeWorkspaceId)
+                }
                 put("workspaces", jsonArray)
             }
 
@@ -360,6 +400,24 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         }
         if (!projectPath.isNullOrBlank() && !CLISecurityValidator.isValidPath(projectPath)) {
             return McpToolResult("Invalid project path (security check failed)", isError = true)
+        }
+
+        val path = args.string("path")
+        if (!path.isNullOrBlank()) {
+            val otherSelectors =
+                listOfNotNull(
+                    workspaceId?.takeIf { it.isNotBlank() },
+                    workspacePath?.takeIf { it.isNotBlank() },
+                    name?.takeIf { it.isNotBlank() },
+                )
+            if (otherSelectors.isNotEmpty()) {
+                return McpToolResult(
+                    "Specify 'path' alone (bootstrap a project directory) or one of 'workspaceId' / " +
+                        "'workspacePath' / 'name' (open or create a saved workspace), not both.",
+                    isError = true,
+                )
+            }
+            return openWorkspaceByPath(path, requestedWindowId)
         }
 
         val targetResolution = resolveTargetWindow(requestedWindowId)
@@ -471,6 +529,137 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         return McpToolResult(resultObj.toString())
     }
 
+    /**
+     * Path-based bootstrap mode of open_workspace (consolidated from #799): open [rawPath] as a
+     * Space in a window, creating its first terminal panel for the panel-scoped terminal tools
+     * (`run_in_panel` and friends). Re-opening a path that is already running re-enters the
+     * Space instead of minting a duplicate (see [matchExistingSpace]).
+     */
+    @Suppress("ReturnCount")
+    private suspend fun openWorkspaceByPath(
+        rawPath: String,
+        requestedWindowId: String?,
+    ): McpToolResult {
+        val pathCheck = checkProjectPath(rawPath)
+        val projectPath =
+            pathCheck.canonicalPath
+                ?: return McpToolResult(pathCheck.error ?: "Invalid path: $rawPath", isError = true)
+
+        val targetResolution = resolveTargetWindow(requestedWindowId)
+        val targetWindowId =
+            when (targetResolution) {
+                is TargetWindowResolution.Success -> targetResolution.windowId
+                is TargetWindowResolution.Failure -> return McpToolResult(targetResolution.errorMessage, isError = true)
+            }
+        val splitViewState =
+            awaitSplitViewState(targetWindowId)
+                ?: return McpToolResult(
+                    "Window '$targetWindowId' did not register its UI state in time; retry.",
+                    isError = true,
+                )
+        val runningIds = workspaceManager.windowWorkspaces.value[targetWindowId].orEmpty()
+        val (space, reused) = resolveBootstrapSpace(targetWindowId, projectPath, runningIds)
+
+        // Fast path: the window already shows this Space, so the live terminal is left alone.
+        if (splitViewState.currentWorkspaceId == space.id) {
+            return McpToolResult(
+                buildPathResult(
+                    reused = true,
+                    windowId = targetWindowId,
+                    space = space,
+                    projectPath = projectPath,
+                ),
+            )
+        }
+
+        switchWindowToSpace(splitViewState, WindowProjectStateRegistry.getOrCreate(targetWindowId), space)
+
+        if (!splitViewState.tabRegistry.isRegistered(TerminalTabType.typeId)) {
+            return McpToolResult(
+                "The Space is open, but the terminal tab type is not registered, so terminal tools have " +
+                    "no panel to attach to. Check that the terminal plugin is installed and enabled, then retry.",
+                isError = true,
+            )
+        }
+
+        return McpToolResult(
+            buildPathResult(
+                reused = reused,
+                windowId = targetWindowId,
+                space = space,
+                projectPath = projectPath,
+            ),
+        )
+    }
+
+    /**
+     * The Space [projectPath] should run in [windowId]: an existing one worth re-entering (see
+     * [matchExistingSpace]), or a fresh bootstrap Space remembered for future re-entry. Returns
+     * the Space and whether it was re-entered rather than created.
+     */
+    private fun resolveBootstrapSpace(
+        windowId: String,
+        projectPath: String,
+        runningIds: Set<String>,
+    ): Pair<LayoutWorkspace, Boolean> {
+        val existing =
+            matchExistingSpace(
+                remembered = createdSpaces[windowId]?.get(projectPath),
+                savedSpaces = workspaceManager.workspaces.value,
+                runningIdsInWindow = runningIds,
+                projectPath = projectPath,
+            )
+        return Pair(
+            existing ?: buildBootstrapSpace(projectPath).also { fresh ->
+                createdSpaces.getOrPut(windowId) { ConcurrentHashMap() }[projectPath] = fresh
+            },
+            existing != null,
+        )
+    }
+
+    /**
+     * Preserve, load, apply: the same three steps the Space switcher takes, so re-entering a
+     * previously running Space restores its preserved tree when the window holds one.
+     */
+    private suspend fun switchWindowToSpace(
+        splitViewState: SplitViewState,
+        windowProjectState: WindowProjectState,
+        space: LayoutWorkspace,
+    ) {
+        withContext(Dispatchers.Main) {
+            val currentWorkspace = workspaceManager.currentWorkspace.value
+            if (currentWorkspace != null && currentWorkspace.id.isNotEmpty()) {
+                splitViewState.preserveCurrentState(currentWorkspace.id, currentWorkspace.name)
+            }
+            workspaceManager.loadWorkspace(space)
+            applyWorkspace(space, splitViewState, windowProjectState, restoreProject = true)
+        }
+    }
+
+    /** The JSON reply for path mode: status plus the ids a caller needs to aim tools at what was opened. */
+    private fun buildPathResult(
+        reused: Boolean,
+        windowId: String,
+        space: LayoutWorkspace,
+        projectPath: String,
+    ): String {
+        val panelId =
+            space.layout
+                .extractPanels()
+                .firstOrNull()
+                ?.first
+                ?: BOOTSTRAP_PANEL_ID
+        return buildJsonObject {
+            put("success", true)
+            put("status", if (reused) "reused" else "opened")
+            put("workspaceId", space.id)
+            put("workspaceName", space.name)
+            put("projectPath", projectPath)
+            put("windowId", windowId)
+            put("panelId", panelId)
+        }.toString()
+    }
+
     private suspend fun handleCreateWorkspace(args: McpToolArgs): McpToolResult {
         val name = args.string("name")
         val projectPath = args.string("projectPath")
@@ -483,7 +672,7 @@ object WorkspaceMcpToolProvider : McpToolProvider {
 
         val id =
             if (isDisposable) {
-                "workspace-disposable-${System.currentTimeMillis()}-${Random.nextInt(1000, 9999)}"
+                "$DISPOSABLE_ID_PREFIX${System.currentTimeMillis()}-${Random.nextInt(1000, 9999)}"
             } else {
                 LayoutWorkspace.generateId()
             }
@@ -622,15 +811,27 @@ object WorkspaceMcpToolProvider : McpToolProvider {
                 is TargetWindowResolution.Failure -> null
             }
 
-        // If disposable, delete file
-        if (workspaceId.contains("disposable")) {
+        // Stop the Space where it is running: clears its tabs and drops any preserved copy,
+        // the same effect closing it in the Space list has.
+        var releasedHere = false
+        if (targetWindowId != null) {
+            val splitViewState = awaitSplitViewState(targetWindowId)
+            if (splitViewState != null) {
+                releasedHere = withContext(Dispatchers.Main) { splitViewState.closeWorkspace(workspaceId) }
+            }
+        }
+
+        // Only delete the file of a disposable workspace this tool minted (prefix, not
+        // substring): a user's saved Space whose name merely mentions "disposable" is not ours.
+        var fileDeleted = false
+        if (workspaceId.startsWith(DISPOSABLE_ID_PREFIX)) {
             val fileName =
                 if (workspaceId.endsWith(".json")) {
                     workspaceId
                 } else {
                     WorkspaceFileManagerCommon.fileNameForId(workspaceId)
                 }
-            getFileManager().deleteWorkspace(fileName)
+            fileDeleted = getFileManager().deleteWorkspace(fileName)
         }
 
         val response =
@@ -640,6 +841,8 @@ object WorkspaceMcpToolProvider : McpToolProvider {
                 if (targetWindowId != null) {
                     put("windowId", targetWindowId)
                 }
+                put("releasedHere", releasedHere)
+                put("fileDeleted", fileDeleted)
             }
 
         return McpToolResult(response.toString())
@@ -679,3 +882,126 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         )
     }
 }
+
+/**
+ * Expands a leading `~` to the user's home directory, the way a shell would, so a path an
+ * agent copy-pasted from a terminal works unchanged. Anything else passes through as-is.
+ */
+internal fun expandTilde(
+    path: String,
+    home: String? = System.getProperty("user.home"),
+): String =
+    when {
+        path == "~" -> home ?: path
+        path.startsWith("~/") -> home?.let { it + path.substring(1) } ?: path
+        else -> path
+    }
+
+private val pathLog = BossLogger.forComponent("WorkspaceMcpToolProvider")
+
+/**
+ * The canonical absolute form of [path], or null when it is not an existing directory.
+ * Every failure (missing, a file, unreadable, security-restricted) means the same thing
+ * to the caller: report a clear error.
+ */
+@Suppress("TooGenericExceptionCaught")
+internal fun canonicalizeOrNull(path: String): String? =
+    try {
+        val dir = File(path)
+        if (dir.isDirectory) dir.canonicalPath else null
+    } catch (t: Throwable) {
+        pathLog.warn(LogCategory.WORKSPACE, "Cannot canonicalize project path: $path", error = t)
+        null
+    }
+
+/**
+ * The outcome of validating the caller's project path for open_workspace path mode: the
+ * canonical directory to open ([canonicalPath]), or the user-facing reason it was refused
+ * ([error]); at most one of the two is set.
+ */
+private data class ProjectPathCheck(
+    val canonicalPath: String?,
+    val error: String?,
+)
+
+private suspend fun checkProjectPath(rawPath: String): ProjectPathCheck {
+    val expandedPath = expandTilde(rawPath)
+    // Same gate the boss://folder deep link runs before opening a project folder: a connected
+    // MCP client is no more trusted than a web page, so both surfaces share one definition of
+    // an acceptable project path, failing closed.
+    val rejection =
+        when {
+            !File(expandedPath).isAbsolute -> {
+                "Path must be absolute (got '$rawPath'): a relative path would resolve against the " +
+                    "BOSS process's working directory, not the caller's."
+            }
+
+            !CLISecurityValidator.isValidPath(expandedPath) -> {
+                "Refusing to open '$rawPath': the path contains characters the boss:// folder deep " +
+                    "link rejects for the same operation (`..`, or shell metacharacters like `;`, `&`, " +
+                    "`|`, `$` and a backtick). Pass a plain absolute path to the project directory instead."
+            }
+
+            else -> {
+                null
+            }
+        }
+    if (rejection != null) {
+        return ProjectPathCheck(null, rejection)
+    }
+    val canonical = withContext(Dispatchers.IO) { canonicalizeOrNull(expandedPath) }
+    return ProjectPathCheck(canonical, "Path is not an existing directory: $rawPath".takeIf { canonical == null })
+}
+
+/**
+ * The bootstrap Space open_workspace opens for a project: one panel, one terminal tab pointed
+ * at the project, named for it, so it reads naturally in the Space picker if the user saves it
+ * (consolidated from #799).
+ */
+internal fun buildBootstrapSpace(canonicalPath: String): LayoutWorkspace {
+    val projectName = canonicalPath.trimEnd('/').extractFileName().ifEmpty { "Project" }
+    return LayoutWorkspace(
+        id = LayoutWorkspace.generateId(),
+        name = projectName,
+        description = "Bootstrap Space opened by the open_workspace MCP tool.",
+        layout =
+            SinglePanel(
+                PanelConfig(
+                    id = WorkspaceMcpToolProvider.BOOTSTRAP_PANEL_ID,
+                    tabs =
+                        listOf(
+                            TabConfig(
+                                type = "terminal",
+                                title = "Terminal",
+                                workingDirectory = canonicalPath,
+                            ),
+                        ),
+                ),
+            ),
+        timestamp = Clock.System.now().toEpochMilliseconds(),
+        projectPath = canonicalPath,
+    )
+}
+
+/**
+ * The Space to re-enter for [projectPath], if there is one worth reusing rather than building a
+ * fresh bootstrap Space (matching rules consolidated from #799):
+ *
+ * 1. a Space this tool already created for the path, when it is running in the window;
+ * 2. a saved Space for the path that is running in the window, the same thing from the user's
+ *    own list;
+ * 3. any saved Space for the path, which applies to this window the way picking it in the Space
+ *    switcher would;
+ * 4. a Space this tool created earlier even though it is no longer running - reusing the object
+ *    keeps its id stable instead of minting a second Space for the same directory.
+ */
+internal fun matchExistingSpace(
+    remembered: LayoutWorkspace?,
+    savedSpaces: List<LayoutWorkspace>,
+    runningIdsInWindow: Set<String>,
+    projectPath: String,
+): LayoutWorkspace? =
+    remembered?.takeIf { it.id in runningIdsInWindow }
+        ?: savedSpaces.firstOrNull { it.id in runningIdsInWindow && it.projectPath == projectPath }
+        ?: savedSpaces.firstOrNull { it.projectPath == projectPath }
+        ?: remembered
