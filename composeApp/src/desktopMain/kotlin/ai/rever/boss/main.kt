@@ -398,6 +398,9 @@ fun main(args: Array<String>) {
         ),
     )
 
+    // Configure MCP workspace tool window creator
+    ai.rever.boss.mcp.WorkspaceMcpToolProvider.windowCreator = { WindowManager.createNewWindow().id }
+
     // Create initial window BEFORE application{} to prevent auto-recreation
     if (!chromiumNeedsDownload) {
         WindowManager.createNewWindow()
