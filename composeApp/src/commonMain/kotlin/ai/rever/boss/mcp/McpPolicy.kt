@@ -118,6 +118,15 @@ object McpMutatingToolCatalog {
             "run_in_panel",
             "send_input",
             "project_replace",
+            // Workspace and Terminal Lifecycle
+            "open_workspace",
+            "workspace_open",
+            "create_workspace",
+            "workspace_create",
+            "open_terminal",
+            "terminal_open",
+            "close_workspace",
+            "workspace_close",
         )
 
     private val MUTATING_SUFFIXES =

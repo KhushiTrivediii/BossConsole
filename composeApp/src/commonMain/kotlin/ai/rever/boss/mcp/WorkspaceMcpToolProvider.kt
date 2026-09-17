@@ -25,7 +25,10 @@ import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.window.WindowProjectStateRegistry
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -64,25 +67,80 @@ object WorkspaceMcpToolProvider : McpToolProvider {
     /** Test hook to resolve split view state for a window. */
     internal var splitViewStateResolver: ((String) -> SplitViewState?)? = null
 
-    /** Test hook / UI hook to directly open a terminal tab. */
-    internal var terminalTabOpener: ((windowId: String, tabInfo: TerminalTabInfo) -> Boolean)? = null
+    /** Test hook / UI hook to directly open a terminal tab and return authoritative tab info. */
+    internal var terminalTabOpener: ((windowId: String, command: String?, cwd: String?) -> TerminalTabInfo?)? = null
+
+    /** Timeout in milliseconds when awaiting compose readiness on cold start. */
+    internal var splitViewWaitTimeoutMs: Long = 5000L
 
     private fun getFileManager(): WorkspaceFileManager = fileManagerProvider?.invoke() ?: WorkspaceFileManager()
 
-    private fun resolveSplitViewState(windowId: String): SplitViewState? =
-        splitViewStateResolver?.invoke(windowId) ?: SplitViewStateRegistry.getState(windowId)
+    @Suppress("ReturnCount")
+    internal suspend fun awaitSplitViewState(
+        windowId: String,
+        timeoutMillis: Long = splitViewWaitTimeoutMs,
+    ): SplitViewState? {
+        splitViewStateResolver?.invoke(windowId)?.let { return it }
+        SplitViewStateRegistry.getState(windowId)?.let { return it }
+        return withTimeoutOrNull(timeoutMillis) {
+            SplitViewStateRegistry.states
+                .filter { it.containsKey(windowId) }
+                .first()[windowId]
+        }
+    }
+
+    sealed class TargetWindowResolution {
+        data class Success(
+            val windowId: String,
+            val isColdStart: Boolean = false,
+        ) : TargetWindowResolution()
+
+        data class Failure(
+            val errorMessage: String,
+        ) : TargetWindowResolution()
+    }
 
     @Suppress("ReturnCount")
-    internal fun resolveTargetWindowId(requestedWindowId: String?): String? {
+    internal fun resolveTargetWindow(requestedWindowId: String?): TargetWindowResolution {
+        // 1. Explicit windowId
         if (!requestedWindowId.isNullOrBlank()) {
-            return requestedWindowId
+            val isRegistered =
+                splitViewStateResolver?.invoke(requestedWindowId) != null ||
+                    SplitViewStateRegistry.isRegistered(requestedWindowId)
+            return if (isRegistered) {
+                TargetWindowResolution.Success(requestedWindowId)
+            } else {
+                TargetWindowResolution.Failure(
+                    "Target window '$requestedWindowId' is not registered or has been closed",
+                )
+            }
         }
-        val actionableId = WindowFocusManager.resolveActionableWindowId()
-        if (actionableId != null) {
-            return actionableId
+
+        // 2. Check registered window states
+        val registeredStates = SplitViewStateRegistry.getAllStates()
+        if (registeredStates.isEmpty()) {
+            // True cold start: zero windows exist. Window creation is permitted.
+            val creator =
+                windowCreator
+                    ?: return TargetWindowResolution.Failure(
+                        "No active windows exist and no window creator is configured",
+                    )
+            val newId = creator.invoke()
+            return TargetWindowResolution.Success(newId, isColdStart = true)
         }
-        return windowCreator?.invoke()
+
+        if (registeredStates.size == 1) {
+            return TargetWindowResolution.Success(registeredStates.keys.first())
+        }
+
+        val openIds = registeredStates.keys.joinToString(", ")
+        return TargetWindowResolution.Failure(
+            "Multiple windows are open ($openIds). Explicit 'windowId' is required to prevent focus interference.",
+        )
     }
+
+    internal fun resolveTargetWindowId(requestedWindowId: String?): String? =
+        (resolveTargetWindow(requestedWindowId) as? TargetWindowResolution.Success)?.windowId
 
     override fun tools(): List<McpToolDefinition> =
         listOf(
@@ -139,7 +197,8 @@ object WorkspaceMcpToolProvider : McpToolProvider {
     private fun createCreateWorkspaceTool(name: String): McpToolDefinition =
         McpToolDefinition(
             name = name,
-            description = "Create a new workspace (optionally disposable) and open it in the target window.",
+            description =
+                "Create and persist a new workspace configuration (optionally disposable) without activating it.",
             inputSchema =
                 """
                 {
@@ -147,9 +206,14 @@ object WorkspaceMcpToolProvider : McpToolProvider {
                     "properties": {
                         "name": { "type": "string", "description": "Name for the workspace" },
                         "projectPath": { "type": "string", "description": "Project root directory" },
-                        "windowId": { "type": "string", "description": "Target window ID" },
-                        "isDisposable": { "type": "boolean", "description": "If true, creates a unique disposable workspace" },
-                        "openTerminal": { "type": "boolean", "description": "Automatically open a terminal tab" }
+                        "isDisposable": {
+                            "type": "boolean",
+                            "description": "If true, creates a unique disposable workspace"
+                        },
+                        "openTerminal": {
+                            "type": "boolean",
+                            "description": "Configure an initial terminal tab in layout"
+                        }
                     }
                 }
                 """.trimIndent(),
@@ -197,10 +261,26 @@ object WorkspaceMcpToolProvider : McpToolProvider {
     // Handlers
     // =========================================================================
 
+    @Suppress("LongMethod")
     private suspend fun handleListWorkspaces(args: McpToolArgs): McpToolResult {
         val windowId = args.string("windowId")
-        val targetWindowId = resolveTargetWindowId(windowId)
-        val splitViewState = targetWindowId?.let { resolveSplitViewState(it) }
+        val targetWindowId =
+            if (!windowId.isNullOrBlank()) {
+                windowId
+            } else {
+                val registered = SplitViewStateRegistry.getAllStates()
+                if (registered.size == 1) {
+                    registered.keys.first()
+                } else if (registered.isEmpty()) {
+                    windowCreator?.invoke()
+                } else {
+                    null
+                }
+            }
+        val splitViewState =
+            targetWindowId?.let {
+                splitViewStateResolver?.invoke(it) ?: SplitViewStateRegistry.getState(it)
+            }
         val activeWorkspaceId = splitViewState?.currentWorkspaceId
 
         val allWorkspaces = mutableMapOf<String, LayoutWorkspace>()
@@ -274,11 +354,14 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         val createIfAbsent = args.boolean("createIfAbsent") ?: false
         val openTerminal = args.boolean("openTerminal") ?: false
 
+        val targetResolution = resolveTargetWindow(requestedWindowId)
         val targetWindowId =
-            resolveTargetWindowId(requestedWindowId)
-                ?: return McpToolResult("No registered window available to open workspace", isError = true)
+            when (targetResolution) {
+                is TargetWindowResolution.Success -> targetResolution.windowId
+                is TargetWindowResolution.Failure -> return McpToolResult(targetResolution.errorMessage, isError = true)
+            }
 
-        val splitViewState = resolveSplitViewState(targetWindowId)
+        val splitViewState = awaitSplitViewState(targetWindowId)
 
         // Locate or create workspace
         var workspace: LayoutWorkspace? = null
@@ -383,13 +466,8 @@ object WorkspaceMcpToolProvider : McpToolProvider {
     private suspend fun handleCreateWorkspace(args: McpToolArgs): McpToolResult {
         val name = args.string("name")
         val projectPath = args.string("projectPath")
-        val requestedWindowId = args.string("windowId")
         val isDisposable = args.boolean("isDisposable") ?: false
         val openTerminal = args.boolean("openTerminal") ?: false
-
-        val targetWindowId =
-            resolveTargetWindowId(requestedWindowId)
-                ?: return McpToolResult("No registered window available to create workspace", isError = true)
 
         val id =
             if (isDisposable) {
@@ -407,27 +485,7 @@ object WorkspaceMcpToolProvider : McpToolProvider {
 
         // Save to file manager
         val fileManager = getFileManager()
-        fileManager.saveWorkspace(workspace)
-
-        val splitViewState = resolveSplitViewState(targetWindowId)
-        if (splitViewState != null) {
-            withContext(Dispatchers.Main) {
-                applyWorkspace(
-                    workspace = workspace,
-                    splitViewState = splitViewState,
-                    windowProjectState = WindowProjectStateRegistry.get(targetWindowId),
-                    restoreProject = true,
-                )
-            }
-        }
-
-        val savedPath = fileManager.getWorkspaceFilePath(id)
-        WorkspaceEventBus.loadWorkspace(savedPath, targetWindowId)
-
-        var terminalInfo: JsonObject? = null
-        if (openTerminal) {
-            terminalInfo = doOpenTerminal(targetWindowId, id, rootPath, command = null)
-        }
+        val filePath = fileManager.saveWorkspace(workspace)
 
         val resultObj =
             buildJsonObject {
@@ -435,11 +493,10 @@ object WorkspaceMcpToolProvider : McpToolProvider {
                 put("workspaceId", id)
                 put("workspaceName", wsName)
                 put("projectPath", rootPath)
-                put("windowId", targetWindowId)
-                put("isDisposable", isDisposable)
-                if (terminalInfo != null) {
-                    put("terminal", terminalInfo)
+                if (filePath != null) {
+                    put("filePath", filePath)
                 }
+                put("isDisposable", isDisposable)
             }
 
         return McpToolResult(resultObj.toString())
@@ -463,53 +520,47 @@ object WorkspaceMcpToolProvider : McpToolProvider {
             }
         }
 
+        val targetResolution = resolveTargetWindow(requestedWindowId)
         val targetWindowId =
-            resolveTargetWindowId(requestedWindowId)
-                ?: return McpToolResult("No registered window available to open terminal", isError = true)
+            when (targetResolution) {
+                is TargetWindowResolution.Success -> {
+                    targetResolution.windowId
+                }
+
+                is TargetWindowResolution.Failure -> {
+                    return McpToolResult(targetResolution.errorMessage, isError = true)
+                }
+            }
 
         val terminalInfo =
             doOpenTerminal(targetWindowId, workspaceId, workingDirectory, command)
-                ?: return McpToolResult("Failed to open terminal in window $targetWindowId", isError = true)
+                ?: return McpToolResult(
+                    "Failed to open terminal in window $targetWindowId",
+                    isError = true,
+                )
 
         return McpToolResult(terminalInfo.toString())
     }
 
+    @Suppress("ReturnCount")
     private suspend fun doOpenTerminal(
         windowId: String,
         workspaceId: String?,
         workingDirectory: String?,
         command: String?,
     ): JsonObject? {
-        val tabId = "terminal-${System.currentTimeMillis()}-${Random.nextInt(1000, 9999)}"
-        val terminalId = tabId.removePrefix("terminal-")
         val effectiveCwd = workingDirectory ?: DefaultWorkingDirectory.nominalPath()
 
-        val tabInfo =
-            TerminalTabInfo(
-                id = tabId,
-                title = "Terminal",
-                workingDirectory = effectiveCwd,
-                initialCommand = command,
-            )
-
-        var openedDirectly = false
-
-        // Try direct opener hook or splitViewState active tabs component
-        val opener = terminalTabOpener
-        if (opener != null) {
-            openedDirectly = opener.invoke(windowId, tabInfo)
-        } else {
-            val splitViewState = resolveSplitViewState(windowId)
-            if (splitViewState != null) {
+        val mountedTab =
+            terminalTabOpener?.invoke(windowId, command, effectiveCwd) ?: run {
+                val splitViewState = awaitSplitViewState(windowId) ?: return null
                 withContext(Dispatchers.Main) {
-                    val activeTabs = splitViewState.getActiveTabsComponent()
-                    if (activeTabs != null) {
-                        activeTabs.addTab(tabInfo)
-                        openedDirectly = true
-                    }
+                    splitViewState.openTerminalInActivePanelNow(command, effectiveCwd)
                 }
-            }
-        }
+            } ?: return null
+
+        val tabId = mountedTab.id
+        val terminalId = tabId.removePrefix("terminal-")
 
         // Always broadcast event for listeners/runners
         TerminalEventBus.openTerminal(
@@ -531,7 +582,7 @@ object WorkspaceMcpToolProvider : McpToolProvider {
             if (command != null) {
                 put("command", command)
             }
-            put("openedDirectly", openedDirectly)
+            put("openedDirectly", true)
         }
     }
 
@@ -542,7 +593,12 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         }
 
         val requestedWindowId = args.string("windowId")
-        val targetWindowId = resolveTargetWindowId(requestedWindowId)
+        val targetResolution = resolveTargetWindow(requestedWindowId)
+        val targetWindowId =
+            when (targetResolution) {
+                is TargetWindowResolution.Success -> targetResolution.windowId
+                is TargetWindowResolution.Failure -> null
+            }
 
         // If disposable, delete file
         if (workspaceId.contains("disposable")) {
