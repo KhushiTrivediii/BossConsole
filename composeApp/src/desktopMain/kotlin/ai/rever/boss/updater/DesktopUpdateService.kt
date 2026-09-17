@@ -210,7 +210,13 @@ actual class UpdateService {
                     "asset" to updateInfo.assetName,
                 ),
             )
-            return downloadFrom(gitHubUrl, updateInfo.assetName, updateInfo.assetSize, sha256 = null, onProgress)
+            return downloadFrom(
+                gitHubUrl,
+                updateInfo.assetName,
+                updateInfo.assetSize,
+                sha256 = updateInfo.sha256,
+                onProgress,
+            )
         }
         return null
     }
