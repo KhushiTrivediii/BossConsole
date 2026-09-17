@@ -168,6 +168,7 @@ class McpPolicyEngine(
     fun policyFor(
         toolName: String,
         providerId: String? = null,
+        readOnly: Boolean? = null,
     ): McpPolicyAction {
         if (_fault.value is McpPolicyFault.PersistedPolicyUnreadable) return McpPolicyAction.DENY
         val configuredTool = _config.value.rules[toolName]
@@ -184,7 +185,7 @@ class McpPolicyEngine(
         if (configuredTool != null) return configuredTool
         if (configuredProvider == McpPolicyAction.ALLOW) return McpPolicyAction.ALLOW
         val risk = DefaultMcpRiskEvaluator().evaluateRisk(toolName, McpToolArgs(emptyMap())).level
-        return if (risk >= McpRiskLevel.HIGH || McpMutatingToolCatalog.isMutating(toolName)) {
+        return if (risk >= McpRiskLevel.HIGH || McpMutatingToolCatalog.isMutating(toolName, readOnly)) {
             _config.value.defaultMutatingAction
         } else {
             _config.value.defaultReadOnlyAction

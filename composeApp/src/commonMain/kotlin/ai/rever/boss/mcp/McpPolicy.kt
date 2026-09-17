@@ -138,10 +138,13 @@ object McpMutatingToolCatalog {
         )
 
     /**
-     * Determine if a tool is mutating based on known tool catalog and naming heuristics.
+     * Determine if a tool is mutating based on tool declaration [readOnly], known tool catalog, and naming heuristics.
      */
-    fun isMutating(toolName: String): Boolean {
-        if (toolName in KNOWN_MUTATING_TOOLS) return true
+    fun isMutating(
+        toolName: String,
+        readOnly: Boolean? = null,
+    ): Boolean {
+        if (readOnly == false || toolName in KNOWN_MUTATING_TOOLS) return true
         val lower = toolName.lowercase()
         return MUTATING_SUFFIXES.any { lower.endsWith(it) }
     }
@@ -152,9 +155,10 @@ object McpMutatingToolCatalog {
     fun resolveAction(
         toolName: String,
         config: McpToolPolicyConfig,
+        readOnly: Boolean? = null,
     ): McpPolicyAction {
         config.rules[toolName]?.let { return it }
-        return if (isMutating(toolName)) {
+        return if (isMutating(toolName, readOnly)) {
             config.defaultMutatingAction
         } else {
             config.defaultReadOnlyAction
