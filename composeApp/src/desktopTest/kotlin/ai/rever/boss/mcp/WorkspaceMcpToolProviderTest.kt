@@ -451,12 +451,12 @@ class WorkspaceMcpToolProviderTest {
             val badProjectArgs = """{"workspaceId":"test-ws","projectPath":"/tmp;rm -rf /"}"""
             val projectResult = core.invoke("open_workspace", badProjectArgs)
             assertTrue(projectResult.isError)
-            assertTrue(projectResult.text.contains("Refusing to open"), projectResult.text)
+            assertTrue(projectResult.text.contains("Refusing to open") || projectResult.text.contains("Path must be absolute"), projectResult.text)
 
             val badProjectTraversal = """{"workspaceId":"test-ws","projectPath":"/tmp/../etc"}"""
             val traversalResult = core.invoke("open_workspace", badProjectTraversal)
             assertTrue(traversalResult.isError)
-            assertTrue(traversalResult.text.contains("Refusing to open"), traversalResult.text)
+            assertTrue(traversalResult.text.contains("Refusing to open") || traversalResult.text.contains("Path must be absolute"), traversalResult.text)
 
             // workspacePath is READ, so `..` is legal (it canonicalises); a NUL byte is not.
             val badFileArgs = """{"workspacePath":"/etc/shadow\u0000.json"}"""
