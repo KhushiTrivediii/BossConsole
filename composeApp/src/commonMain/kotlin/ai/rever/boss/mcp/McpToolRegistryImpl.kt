@@ -763,11 +763,11 @@ internal class McpToolRegistryCore(
         // Escalate to ASK so the operator reviews the specific arguments before the call runs.
         val effectivePolicy =
             if (policy == McpPolicyAction.ALLOW) {
-            val risk = DefaultMcpRiskEvaluator().evaluateRisk(toolName, args)
-            if (risk.level == McpRiskLevel.CRITICAL) McpPolicyAction.ASK else policy
-        } else {
-            policy
-        }
+                val risk = DefaultMcpRiskEvaluator().evaluateRisk(toolName, args)
+                if (risk.level == McpRiskLevel.CRITICAL) McpPolicyAction.ASK else policy
+            } else {
+                policy
+            }
         val startTime = System.nanoTime()
         var disposition = McpApprovalDisposition.AUTO_ALLOWED
         var result: McpToolResult? = null
