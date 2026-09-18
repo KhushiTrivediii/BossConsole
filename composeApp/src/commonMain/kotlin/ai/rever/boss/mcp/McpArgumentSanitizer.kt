@@ -98,13 +98,15 @@ object McpArgumentSanitizer {
     private val sensitiveAssignment =
         Regex(
             """(?i)(?:password|token|secret|api[_-]?key|authorization|credential)""" +
-                """\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s&,;}]+)""",
+                """\s*[:=]\s*(?:"[^"]*"|'[^']*'|(?:(?:Bearer|Basic|Token|Negotiate)\s+)?[^\s&,;}'"]+)""",
         )
     private val bearer = Regex("""(?i)Bearer\s+[^\s"',;}]+""")
+    private val uriUserInfo = Regex("""(?i)([a-z0-9+.-]+)://([^:\s]+):([^@\s]+)@""")
 
     fun sanitizeMessage(text: String): String =
         text
             .replace(credentialShapePattern, "[REDACTED]")
             .replace(sensitiveAssignment, "[REDACTED]")
             .replace(bearer, "Bearer [REDACTED]")
+            .replace(uriUserInfo, "$1://$2:[REDACTED]@")
 }
