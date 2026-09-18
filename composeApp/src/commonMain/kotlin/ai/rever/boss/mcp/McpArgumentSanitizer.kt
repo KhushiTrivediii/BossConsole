@@ -109,10 +109,21 @@ object McpArgumentSanitizer {
         )
     private val bearer = Regex("""(?i)Bearer\s+[^\s"',;}]+""")
 
+    /**
+     * `curl -u user:pass` (or `--user user:pass`) is not a URI, so [LogSanitizer.redactUrlUserInfo]
+     * does not catch it. The credential is the part after the colon, up to the next whitespace.
+     */
+    private val curlUserOption =
+        Regex("""(?i)(-u|--user)\s+(\S+):(\S+)""")
+
     fun sanitizeMessage(text: String): String =
-        text
+        LogSanitizer
+            .redactUrlUserInfo(text)
             .replace(credentialShapePattern, "[REDACTED]")
             .replace(sensitiveAssignment, "[REDACTED]")
             .replace(authorizationHeader, "[REDACTED]")
             .replace(bearer, "Bearer [REDACTED]")
+            .replace(curlUserOption) { mr ->
+                "${mr.groupValues[1]} ${mr.groupValues[2]}:[REDACTED]"
+            }
 }
