@@ -469,13 +469,8 @@ object WorkspaceMcpToolProvider : McpToolProvider {
             // Check saved workspaces
             if (workspace == null) {
                 val fileManager = getFileManager()
-                val fileName =
-                    if (workspaceId.endsWith(".json")) {
-                        workspaceId
-                    } else {
-                        WorkspaceFileManagerCommon.fileNameForId(workspaceId)
-                    }
-                workspace = fileManager.loadWorkspace(fileName) ?: fileManager.loadWorkspace(workspaceId)
+                val fileName = WorkspaceFileManagerCommon.fileNameForId(workspaceId.removeSuffix(".json"))
+                workspace = fileManager.loadWorkspace(fileName)
             }
         }
 
@@ -936,12 +931,7 @@ object WorkspaceMcpToolProvider : McpToolProvider {
         // substring): a user's saved Space whose name merely mentions "disposable" is not ours.
         var fileDeleted = false
         if (workspaceId.startsWith(DISPOSABLE_ID_PREFIX)) {
-            val fileName =
-                if (workspaceId.endsWith(".json")) {
-                    workspaceId
-                } else {
-                    WorkspaceFileManagerCommon.fileNameForId(workspaceId)
-                }
+            val fileName = WorkspaceFileManagerCommon.fileNameForId(workspaceId.removeSuffix(".json"))
             fileDeleted = getFileManager().deleteWorkspace(fileName)
         }
 

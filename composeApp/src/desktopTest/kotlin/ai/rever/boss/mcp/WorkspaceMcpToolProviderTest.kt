@@ -852,6 +852,35 @@ class WorkspaceMcpToolProviderTest {
             assertNotNull(fileManager.loadWorkspace(WorkspaceFileManagerCommon.fileNameForId("disposable-env")))
         }
 
+    @Test
+    fun `open_workspace with path traversal workspaceId is sanitized`(): Unit =
+        runBlocking {
+            val core = createTestCore()
+            val badId = "disposable-../../etc/bad.json"
+            val openResult = core.invoke("open_workspace", """{"workspaceId":"$badId"}""")
+            assertTrue(openResult.isError, openResult.text)
+
+            val parentDir = workspaceDir.parentFile
+            val badFileInParent = File(parentDir, "bad.json")
+            assertFalse(badFileInParent.exists(), "Traversal file must not exist in parent directory")
+        }
+
+    @Test
+    fun `close_workspace with disposable path traversal workspaceId does not delete outside workspace`(): Unit =
+        runBlocking {
+            val core = createTestCore()
+            val outsideFile = File(workspaceDir.parentFile, "test-target-file-862.txt")
+            outsideFile.writeText("sensitive content")
+            try {
+                assertTrue(outsideFile.exists())
+                val badId = "disposable-../../${outsideFile.name}.json"
+                val closeResult = core.invoke("close_workspace", """{"workspaceId":"$badId"}""")
+                assertTrue(outsideFile.exists(), "File outside workspace directory must not be deleted")
+            } finally {
+                outsideFile.delete()
+            }
+        }
+
     private fun savedSpaceFixture(
         id: String,
         projectPath: String,
