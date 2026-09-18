@@ -6,7 +6,7 @@
 -- the same privileges PostgREST applies; fixtures and leaks are staged as the
 -- test owner between them.
 begin;
-select plan(17);
+select plan(18);
 
 do $fixture$
 declare existing uuid;
@@ -130,6 +130,18 @@ select is(
        and grantee in ('anon', 'authenticated') and privilege_type in ('INSERT', 'UPDATE')),
     0,
     'no client role can write either ciphertext column');
+select ok(
+    not has_column_privilege('authenticated', 'public.secrets', 'password_encrypted', 'UPDATE')
+    and not has_column_privilege('authenticated', 'public.secrets', 'password_encrypted', 'INSERT')
+    and not has_column_privilege('anon', 'public.secrets', 'password_encrypted', 'UPDATE')
+    and not has_column_privilege('anon', 'public.secrets', 'password_encrypted', 'INSERT')
+    and not has_column_privilege(
+        'authenticated', 'public.secret_metadata', 'recovery_codes_encrypted', 'UPDATE')
+    and not has_column_privilege(
+        'authenticated', 'public.secret_metadata', 'recovery_codes_encrypted', 'INSERT')
+    and not has_column_privilege('anon', 'public.secret_metadata', 'recovery_codes_encrypted', 'UPDATE')
+    and not has_column_privilege('anon', 'public.secret_metadata', 'recovery_codes_encrypted', 'INSERT'),
+    'no client role holds effective INSERT or UPDATE on either ciphertext column');
 select ok(
     has_column_privilege('authenticated', 'public.secrets', 'website', 'UPDATE')
     and has_column_privilege('authenticated', 'public.secret_metadata', 'twofa_secret', 'UPDATE'),
