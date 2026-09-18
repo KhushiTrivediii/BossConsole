@@ -761,7 +761,8 @@ internal class McpToolRegistryCore(
         // A standing ALLOW (persisted rule, provider trust, session trust, read-only default)
         // must not silently execute commands the risk evaluator itself rates CRITICAL (#895).
         // Escalate to ASK so the operator reviews the specific arguments before the call runs.
-        val effectivePolicy = if (policy == McpPolicyAction.ALLOW) {
+        val effectivePolicy =
+            if (policy == McpPolicyAction.ALLOW) {
             val risk = DefaultMcpRiskEvaluator().evaluateRisk(toolName, args)
             if (risk.level == McpRiskLevel.CRITICAL) McpPolicyAction.ASK else policy
         } else {

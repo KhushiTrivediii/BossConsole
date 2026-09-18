@@ -1,7 +1,7 @@
 package ai.rever.boss.mcp
 
-import ai.rever.boss.mcp.sandbox.McpRiskLevel
 import ai.rever.boss.mcp.sandbox.DefaultMcpRiskEvaluator
+import ai.rever.boss.mcp.sandbox.McpRiskLevel
 import ai.rever.boss.plugin.api.McpToolArgs
 import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolHandler
@@ -12,8 +12,8 @@ import java.io.File
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertTrue
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 /**
  * Regression tests for issue #895: MCP standing ALLOWs must not silently execute
@@ -94,6 +94,7 @@ class McpCriticalReAskTest {
         vararg defs: McpToolDefinition,
     ) = object : McpToolProvider {
         override val providerId = id
+
         override fun tools() = defs.toList()
     }
 
@@ -119,10 +120,11 @@ class McpCriticalReAskTest {
             engine.setToolPolicy("run_command", McpPolicyAction.ALLOW)
             assertEquals(McpPolicyAction.ALLOW, engine.policyFor("run_command", "terminal-tab"))
 
-            val core = McpToolRegistryCore(
-                disabledFile = tempDisabledFile(),
-                policyEngine = engine,
-            )
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = tempDisabledFile(),
+                    policyEngine = engine,
+                )
             core.registerProvider(provider("terminal-tab", echoTool("run_command")))
 
             // A destructive command that the risk evaluator rates CRITICAL
@@ -141,10 +143,11 @@ class McpCriticalReAskTest {
             val engine = McpPolicyEngine(policyFile = policyFile)
             engine.setToolPolicy("run_command", McpPolicyAction.ALLOW)
 
-            val core = McpToolRegistryCore(
-                disabledFile = tempDisabledFile(),
-                policyEngine = engine,
-            )
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = tempDisabledFile(),
+                    policyEngine = engine,
+                )
             core.registerProvider(provider("terminal-tab", echoTool("run_command")))
 
             // A benign command that the risk evaluator rates HIGH (not CRITICAL)
@@ -164,10 +167,11 @@ class McpCriticalReAskTest {
             engine.trustForSession("run_command", "terminal-tab")
             assertEquals(McpPolicyAction.ALLOW, engine.policyFor("run_command", "terminal-tab"))
 
-            val core = McpToolRegistryCore(
-                disabledFile = tempDisabledFile(),
-                policyEngine = engine,
-            )
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = tempDisabledFile(),
+                    policyEngine = engine,
+                )
             core.registerProvider(provider("terminal-tab", echoTool("run_command")))
 
             val result = core.invoke("run_command", """{"command":"git push --force"}""")
@@ -184,10 +188,11 @@ class McpCriticalReAskTest {
             // "Trust this plugin" — provider-wide ALLOW
             engine.setProviderPolicy("terminal-tab", McpPolicyAction.ALLOW)
 
-            val core = McpToolRegistryCore(
-                disabledFile = tempDisabledFile(),
-                policyEngine = engine,
-            )
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = tempDisabledFile(),
+                    policyEngine = engine,
+                )
             core.registerProvider(provider("terminal-tab", echoTool("run_command")))
 
             val result = core.invoke("run_command", """{"command":"mkfs.ext4 /dev/sda1"}""")
@@ -218,10 +223,11 @@ class McpCriticalReAskTest {
             // Persist an ALLOW for secret_get (CRITICAL by name, not by args)
             engine.setToolPolicy("secret_get", McpPolicyAction.ALLOW)
 
-            val core = McpToolRegistryCore(
-                disabledFile = tempDisabledFile(),
-                policyEngine = engine,
-            )
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = tempDisabledFile(),
+                    policyEngine = engine,
+                )
             core.registerProvider(provider("terminal-tab", echoTool("secret_get")))
 
             // Even with no args, secret_get is CRITICAL → must escalate to ASK
