@@ -76,6 +76,8 @@ BEGIN
           AND a.attname <> ALL (target.cols);
 
         FOREACH client_role IN ARRAY ARRAY['anon', 'authenticated'] LOOP
+            CONTINUE WHEN pg_catalog.to_regrole(client_role) IS NULL;
+
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE'] LOOP
                 -- has_table_privilege is true only for a table-level grant (or
                 -- ownership), never because of column-level grants, so this
@@ -91,6 +93,23 @@ BEGIN
                     EXECUTE pg_catalog.format(
                         'GRANT %s (%s) ON TABLE public.%I TO %I',
                         privilege, writable, target.tbl, client_role);
+                END IF;
+
+                -- Fail closed if access survived through PUBLIC or an
+                -- inherited role. Revoking the client's direct ACL entry
+                -- cannot remove either source of effective privilege.
+                IF pg_catalog.has_column_privilege(
+                    client_role,
+                    pg_catalog.format('public.%I', target.tbl),
+                    target.cols[1],
+                    privilege
+                ) THEN
+                    RAISE EXCEPTION USING
+                        errcode = '42501',
+                        message = pg_catalog.format(
+                            'client %s retains %s on public.%s.%s',
+                            client_role, privilege, target.tbl, target.cols[1]),
+                        hint = 'Revoke the privilege from PUBLIC or the inherited role.';
                 END IF;
             END LOOP;
         END LOOP;
