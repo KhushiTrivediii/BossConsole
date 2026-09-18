@@ -12,8 +12,9 @@ import kotlin.test.assertTrue
  * dialog or the MCP operation ledger.
  */
 class McpArgumentSanitizerUriCredentialTest {
-    private fun command(cmd: String): String =
-        assertNotNull(McpArgumentSanitizer.sanitize(mapOf("command" to cmd))["command"])
+    private fun command(cmd: String): String {
+        return assertNotNull(McpArgumentSanitizer.sanitize(mapOf("command" to cmd))["command"])
+    }
 
     // -- URI userinfo redaction -----------------------------------
 
@@ -125,7 +126,7 @@ class McpArgumentSanitizerUriCredentialTest {
 
     @Test
     fun `existing JWT shape redaction still works`() {
-        val jwt = "eyJhbG...c123"
+        val jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.afdsafdsafds"
         val out = command("curl -H 'X: $jwt'")
         assertFalse(out.contains(jwt), "JWT leaked: $out")
         assertTrue(out.contains("[REDACTED]"), out)
