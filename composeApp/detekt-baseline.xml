@@ -110,7 +110,6 @@
     <ID>CyclomaticComplexMethod:BrowserFunctions.kt$private fun configureBrowserPopupHandler( browser: Browser, onOpenInNewTab: (String) -&gt; Unit, )</ID>
     <ID>CyclomaticComplexMethod:BrowserHandleImpl.kt$BrowserHandleImpl$@OptIn(ExperimentalComposeUiApi::class) @Composable override fun Content()</ID>
     <ID>CyclomaticComplexMethod:BrowserHandleImpl.kt$BrowserHandleImpl$override fun dispatchCoBrowseInput(inputJson: String)</ID>
-    <ID>CyclomaticComplexMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun getFormFieldInfoFromJS(frame: com.teamdev.jxbrowser.frame.Frame): FormFieldInfo?</ID>
     <ID>CyclomaticComplexMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun jsKeyToKeyCode( key: String, code: String, ): KeyCode</ID>
     <ID>CyclomaticComplexMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun setupEventListeners()</ID>
     <ID>CyclomaticComplexMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun setupPopupHandler()</ID>
@@ -266,7 +265,6 @@
     <ID>LongMethod:BrowserFunctions.kt$private fun configureBrowserPopupHandler( browser: Browser, onOpenInNewTab: (String) -&gt; Unit, )</ID>
     <ID>LongMethod:BrowserHandleImpl.kt$BrowserHandleImpl$@OptIn(ExperimentalComposeUiApi::class) @Composable override fun Content()</ID>
     <ID>LongMethod:BrowserHandleImpl.kt$BrowserHandleImpl$override fun dispatchCoBrowseInput(inputJson: String)</ID>
-    <ID>LongMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun getFormFieldInfoFromJS(frame: com.teamdev.jxbrowser.frame.Frame): FormFieldInfo?</ID>
     <ID>LongMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun setupContextMenuHandler()</ID>
     <ID>LongMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun setupEventListeners()</ID>
     <ID>LongMethod:BrowserHandleImpl.kt$BrowserHandleImpl$private fun setupPopupHandler()</ID>
