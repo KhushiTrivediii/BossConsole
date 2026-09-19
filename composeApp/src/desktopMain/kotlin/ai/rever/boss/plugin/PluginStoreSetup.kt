@@ -124,7 +124,6 @@ internal suspend fun finishBackgroundSystemPluginUpdate(update: BackgroundSystem
 object PluginStoreSetup {
     private val logger = BossLogger.forComponent("PluginStoreSetup")
 
-    private val manifestJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
     private var initialized = false
 
     /**
@@ -2242,15 +2241,9 @@ object PluginStoreSetup {
     /**
      * Read plugin manifest from a JAR file.
      */
-    private fun readPluginManifest(jarFile: File): ai.rever.boss.plugin.api.PluginManifest? {
-        return try {
-            java.util.jar.JarFile(jarFile).use { jar ->
-                val entry =
-                    jar.getJarEntry("META-INF/boss-plugin/plugin.json")
-                        ?: return null
-                val content = jar.getInputStream(entry).bufferedReader().readText()
-                manifestJson.decodeFromString<ai.rever.boss.plugin.api.PluginManifest>(content)
-            }
+    private fun readPluginManifest(jarFile: File): ai.rever.boss.plugin.api.PluginManifest? =
+        try {
+            PluginManifestReader.readFromJar(jarFile.absolutePath)
         } catch (e: Exception) {
             logger.error(
                 LogCategory.SYSTEM,
@@ -2262,7 +2255,6 @@ object PluginStoreSetup {
             )
             null
         }
-    }
 
     /**
      * Returns a human-readable reason if a plugin declaring [minIpcVersion]
