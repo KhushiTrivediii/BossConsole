@@ -46,7 +46,19 @@ internal fun validateUpdateAssetName(assetName: String) {
     }
 }
 
-actual class UpdateService {
+actual class UpdateService internal constructor(
+    private val gitHubSource: UpdateSource = GitHubUpdateSource(),
+    private val stagingDir: File = defaultStagingDir(),
+) {
+    /**
+     * Primary constructor used in production (matches expect declaration). Both
+     * parameters take defaults in the internal constructor; this actual-constructor
+     * signature matches `expect class UpdateService()` in commonMain so the
+     * production code gets the real GitHub Releases source and the shared
+     * staging directory.
+     */
+    actual constructor() : this(GitHubUpdateSource())
+
     private val logger = BossLogger.forComponent("UpdateService")
 
     /**
@@ -55,9 +67,6 @@ actual class UpdateService {
      * BOSS_UPDATE_PRIMARY_SOURCE for testing/rollback.
      */
     private val source: UpdateSource = buildSource()
-
-    /** Dedicated GitHub source used only to recover a download if the primary URL fails. */
-    private val gitHubSource = GitHubUpdateSource()
 
     private fun buildSource(): UpdateSource =
         when (UpdateSourceConfig.primarySource) {
@@ -210,13 +219,26 @@ actual class UpdateService {
                     "asset" to updateInfo.assetName,
                 ),
             )
-            return downloadFrom(gitHubUrl, updateInfo.assetName, updateInfo.assetSize, sha256 = null, onProgress)
+            return downloadFrom(
+                url = gitHubUrl,
+                assetName = updateInfo.assetName,
+                assetSize = updateInfo.assetSize,
+                sha256 = updateInfo.sha256,
+                onProgress = onProgress,
+            )
         }
         return null
     }
 
-    /** Download [url] to a temp file, verifying [sha256] when provided. Returns the path or null. */
-    private suspend fun downloadFrom(
+    /**
+     * Download [url] to a temp file in [stagingDir], verifying [sha256] when
+     * provided. Returns the path or null.
+     *
+     * `internal` (not private) so the fallback-checksum regression test (BossConsole#797)
+     * can drive the verification path directly against a local HTTP server, instead of
+     * reproducing the full primary-failure + GitHub-resolution dance.
+     */
+    internal suspend fun downloadFrom(
         url: String,
         assetName: String,
         assetSize: Long,
@@ -246,7 +268,7 @@ actual class UpdateService {
             // owner-only: this is where the installer artifact waits between
             // checksum verification and an elevated install, so another local user
             // must not be able to swap it (fails closed).
-            val tempDir = createRestrictedDir(defaultStagingDir())
+            val tempDir = createRestrictedDir(stagingDir)
 
             val downloadFile = File(tempDir, assetName)
             if (downloadFile.exists()) {
@@ -257,29 +279,7 @@ actual class UpdateService {
             streamToFile(url, assetSize, downloadFile, onProgress)
 
             if (downloadFile.exists() && downloadFile.length() > 0) {
-                // Integrity check, NOT authenticity: the hash and URL come from the same
-                // app_releases row, so this guards against Storage/CDN corruption, not a
-                // compromised catalog. Update authenticity still rests on OS code-signing.
-                val actualSha = if (sha256 != null) sha256Of(downloadFile) else null
-                if (sha256 != null && !sha256.equals(actualSha, ignoreCase = true)) {
-                    logger.error(
-                        LogCategory.SYSTEM,
-                        "Update checksum mismatch; discarding download",
-                        mapOf(
-                            "asset" to assetName,
-                            "expected" to sha256,
-                            "actual" to (actualSha ?: ""),
-                        ),
-                    )
-                    downloadFile.delete()
-                    null
-                } else {
-                    if (sha256 != null) {
-                        logger.info(LogCategory.SYSTEM, "Update checksum verified", mapOf("asset" to assetName))
-                    }
-                    logger.info(LogCategory.SYSTEM, "Update downloaded successfully", mapOf("path" to downloadFile.absolutePath))
-                    downloadFile.absolutePath
-                }
+                verifyDownloadedAsset(downloadFile, assetName, sha256)
             } else {
                 logger.error(LogCategory.SYSTEM, "Download failed - file is empty or doesn't exist")
                 null
@@ -308,6 +308,55 @@ actual class UpdateService {
         }
     }
 
+    /**
+     * The post-download gate both download paths share (BossConsole#797): verify the
+     * staged bytes against the catalog hash when one was provided, and only then
+     * hand the path to the caller for install.
+     *
+     * Integrity check, NOT authenticity: the hash and URL come from the same
+     * app_releases row, so this guards against Storage/CDN corruption and a tampered
+     * fallback hop, not a compromised catalog. Update authenticity still rests on OS
+     * code-signing. A mismatch is discarded and reported; a verified download (or a
+     * source that genuinely cannot describe a hash) is staged.
+     */
+    private fun verifyDownloadedAsset(
+        downloadFile: File,
+        assetName: String,
+        sha256: String?,
+    ): String? {
+        val cleanSha = sha256?.trim()?.takeIf { it.isNotBlank() }
+        val actualSha = if (cleanSha != null) sha256Of(downloadFile) else null
+        if (cleanSha != null && !cleanSha.equals(actualSha, ignoreCase = true)) {
+            logger.error(
+                LogCategory.SYSTEM,
+                "Update checksum mismatch; discarding download",
+                mapOf(
+                    "asset" to assetName,
+                    "expected" to cleanSha,
+                    "actual" to (actualSha ?: ""),
+                ),
+            )
+            val deleted = runCatching { downloadFile.delete() }.getOrDefault(false)
+            if (!deleted) {
+                // Not an install vector - the installer only uses the returned path,
+                // and the next attempt deletes before writing. But the KDoc above
+                // promises a discard, so a failed delete must be visible, not silent
+                // (a Windows AV scanner holding a freshly written MSI is the case).
+                logger.error(
+                    LogCategory.SYSTEM,
+                    "Mismatched update download could not be deleted from staging",
+                    mapOf("path" to downloadFile.absolutePath),
+                )
+            }
+            return null
+        }
+        if (cleanSha != null) {
+            logger.info(LogCategory.SYSTEM, "Update checksum verified", mapOf("asset" to assetName))
+        }
+        logger.info(LogCategory.SYSTEM, "Update downloaded successfully", mapOf("path" to downloadFile.absolutePath))
+        return downloadFile.absolutePath
+    }
+
     /** Resolve the GitHub Releases asset URL for [version] — the download-time backup. */
     private suspend fun gitHubAssetUrlFor(version: Version): String? =
         try {
@@ -318,8 +367,6 @@ actual class UpdateService {
             logger.warn(LogCategory.NETWORK, "Could not resolve GitHub fallback asset", error = e)
             null
         }
-
-    /** Compute the lowercase hex SHA-256 of [file]. */
 
     /**
      * Stream a download to [destFile], reporting throttled progress.
