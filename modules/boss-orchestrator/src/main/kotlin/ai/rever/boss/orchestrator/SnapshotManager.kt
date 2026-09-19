@@ -37,6 +37,7 @@ class SnapshotManager(
         return targetDir
     }
 
+    @Suppress("TooGenericExceptionCaught")
     private fun atomicWrite(
         file: File,
         bytes: ByteArray,
