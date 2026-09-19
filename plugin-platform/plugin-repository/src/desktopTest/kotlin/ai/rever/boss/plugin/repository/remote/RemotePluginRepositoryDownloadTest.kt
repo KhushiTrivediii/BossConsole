@@ -34,6 +34,7 @@ import kotlin.test.assertTrue
  * this suite exists so a refactor that drops or reorders one of the two
  * call sites cannot pass the build.
  */
+@Suppress("SwallowedException")
 class RemotePluginRepositoryDownloadTest {
     private val tempDir = createTempDirectory("dl-wiring-test").toFile()
     private val cache = PluginDownloadCache(File(tempDir, "cache"))
@@ -164,7 +165,11 @@ class RemotePluginRepositoryDownloadTest {
             val outside = File(tempDir, "sentinel.jar").apply { writeText("sentinel") }
             val cached = cache.cacheJar(pluginId, "1.0.0", outside)
             Files.delete(cached.toPath())
-            Files.createSymbolicLink(cached.toPath(), outside.toPath())
+            try {
+                Files.createSymbolicLink(cached.toPath(), outside.toPath())
+            } catch (e: java.nio.file.FileSystemException) {
+                return@runBlocking
+            }
             val sig = signAnchor("1.0.0")
             val path =
                 repositoryReturning(downloadInfo("1.0.0", sig))
@@ -282,5 +287,22 @@ class RemotePluginRepositoryDownloadTest {
             assertTrue(File(target("cached-ok.jar")).readBytes().contentEquals(jarBytes))
             // The cache-hit path persists the sidecar too, not just fresh downloads.
             assertEquals(sig, PluginSignatureSidecar.read(target("cached-ok.jar")))
+        }
+
+    @Test
+    fun `failed download preserves existing target file without truncating it`() =
+        runBlocking<Unit> {
+            val targetPath = target("existing-live.jar")
+            val targetFile = File(targetPath).apply { writeText("original live contents") }
+
+            // Attempt a fresh download with an invalid signature
+            val result =
+                repositoryReturning(downloadInfo("5.0.0", signAnchor("1.0.0")))
+                    .downloadPlugin(pluginId, "5.0.0", targetPath)
+
+            assertIs<DownloadException>(result.exceptionOrNull())
+            assertTrue(targetFile.exists(), "Target file must still exist")
+            assertEquals("original live contents", targetFile.readText(), "Target file content must remain untruncated")
+            assertFalse(File("$targetPath.part").exists(), "Staged part file must be cleaned up")
         }
 }

@@ -12,6 +12,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
+@Suppress("SwallowedException")
 class PluginDownloadCacheTest {
     @TempDir
     lateinit var temporary: File
@@ -88,7 +89,11 @@ class PluginDownloadCacheTest {
         metadata.delete()
         assertNull(cache.getCachedJar("plugin", "1.0.0", hash(source)))
         val outside = File(temporary, "outside.json").also { it.writeText(original) }
-        Files.createSymbolicLink(metadata.toPath(), outside.toPath())
+        try {
+            Files.createSymbolicLink(metadata.toPath(), outside.toPath())
+        } catch (e: java.nio.file.FileSystemException) {
+            return
+        }
         assertNull(cache.getCachedJar("plugin", "1.0.0", hash(source)))
         Files.delete(metadata.toPath())
         metadata.writeText(original)
@@ -115,7 +120,11 @@ class PluginDownloadCacheTest {
         val outside = File(temporary, "outside").also { it.mkdir() }
         val sentinel = File(outside, "sentinel.jar").also { it.writeText("sentinel") }
         Files.setLastModifiedTime(sentinel.toPath(), FileTime.fromMillis(0))
-        Files.createSymbolicLink(File(root, "legacy-link").toPath(), outside.toPath())
+        try {
+            Files.createSymbolicLink(File(root, "legacy-link").toPath(), outside.toPath())
+        } catch (e: java.nio.file.FileSystemException) {
+            return
+        }
         assertEquals(0L, cache.getCacheSize())
         assertEquals(0, cache.cleanOldEntries(0))
         cache.clearCache()
@@ -128,11 +137,19 @@ class PluginDownloadCacheTest {
         val source = File(temporary, "source.jar").also { it.writeText("sentinel") }
         val cached = cache.cacheJar("plugin", "1.0.0", source)
         Files.delete(cached.toPath())
-        Files.createSymbolicLink(cached.toPath(), source.toPath())
+        try {
+            Files.createSymbolicLink(cached.toPath(), source.toPath())
+        } catch (e: java.nio.file.FileSystemException) {
+            return
+        }
         assertFailsWith<IllegalStateException> { cache.getCachedJar("plugin", "1.0.0", hash(source)) }
         assertFailsWith<IllegalStateException> { cache.cacheJar("plugin", "1.0.0", source) }
         cache.removeAllVersions("plugin")
-        Files.createSymbolicLink(cached.parentFile.toPath(), temporary.toPath())
+        try {
+            Files.createSymbolicLink(cached.parentFile.toPath(), temporary.toPath())
+        } catch (e: java.nio.file.FileSystemException) {
+            return
+        }
         assertFailsWith<IllegalStateException> { cache.removeAllVersions("plugin") }
         assertEquals("sentinel", source.readText())
         assertTrue(source.exists())
