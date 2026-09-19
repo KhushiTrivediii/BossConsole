@@ -100,4 +100,13 @@ class AtomicFileWriteTest {
             assertEquals("rw-------", permStr)
         }
     }
+
+    @Test
+    fun `atomicWriteText handles single character file names`() {
+        val target = File(tempDir, "a")
+
+        target.atomicWriteText("single char")
+
+        assertEquals("single char", target.readText())
+    }
 }

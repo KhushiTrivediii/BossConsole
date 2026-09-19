@@ -71,7 +71,8 @@ private fun setOwnerOnlyPermissions(file: File) {
  */
 fun File.atomicWriteText(text: String) {
     parentFile?.mkdirs()
-    val tmp = File.createTempFile("$name.", ".tmp", parentFile)
+    val prefix = "$name.".let { if (it.length < 3) it.padEnd(3, '_') else it }
+    val tmp = File.createTempFile(prefix, ".tmp", parentFile)
     try {
         setOwnerOnlyPermissions(tmp)
         tmp.writeText(text)
