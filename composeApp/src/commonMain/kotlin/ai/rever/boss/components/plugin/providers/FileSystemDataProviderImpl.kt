@@ -5,6 +5,7 @@ import ai.rever.boss.components.plugin.panels.left_top.directoryHasChildren
 import ai.rever.boss.components.plugin.panels.left_top.scanDirectory
 import ai.rever.boss.plugin.api.FileNodeData
 import ai.rever.boss.plugin.api.FileSystemDataProvider
+import ai.rever.boss.plugin.pathutils.BossDirectories
 import ai.rever.boss.utils.logging.BossLogger
 import ai.rever.boss.utils.logging.LogCategory
 import ai.rever.boss.utils.revealInFileManager
@@ -177,23 +178,14 @@ class FileSystemDataProviderImpl :
             try {
                 val file = java.io.File(path)
 
-                // Security: Validate path is within user's home directory (prevent path traversal)
+                // Security: Validate path is strictly inside user's home directory (user.home itself is forbidden)
                 val canonicalFile = file.canonicalFile
                 val homeDir = File(System.getProperty("user.home")).canonicalFile
-                if (!canonicalFile.absolutePath.startsWith(homeDir.absolutePath + File.separator) &&
-                    canonicalFile.absolutePath != homeDir.absolutePath
-                ) {
+                if (!canonicalFile.absolutePath.startsWith(homeDir.absolutePath + File.separator)) {
                     return@withContext Result.failure(SecurityException("Access denied: file path outside user directory"))
                 }
 
-                // Note: We don't check exists() first to avoid race conditions.
-                // delete() and deleteRecursively() handle non-existent files gracefully.
-                val deleted =
-                    if (file.isDirectory) {
-                        file.deleteRecursively()
-                    } else {
-                        file.delete()
-                    }
+                val deleted = BossDirectories.deleteSafelyWithoutFollowingLinks(file)
 
                 if (deleted) {
                     Result.success(Unit)

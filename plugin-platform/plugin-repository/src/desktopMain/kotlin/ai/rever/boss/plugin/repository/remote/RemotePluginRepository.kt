@@ -195,6 +195,23 @@ class RemotePluginRepository(
         }
     }
 
+    private fun promoteStagedFile(
+        stagedFile: File,
+        targetFile: File,
+    ) {
+        try {
+            java.nio.file.Files.move(
+                stagedFile.toPath(),
+                targetFile.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
+        } catch (e: Exception) {
+            stagedFile.copyTo(targetFile, overwrite = true)
+            deleteOrWarn(stagedFile, "staged file after copy fallback")
+        }
+    }
+
     private val downloadHttpClient =
         HttpClient(CIO) {
             engine {
@@ -417,86 +434,98 @@ class RemotePluginRepository(
                         ),
                     )
 
-                    // Download with progress tracking
-                    downloadHttpClient.prepareGet(downloadInfo.downloadUrl).execute { response ->
-                        val channel = response.bodyAsChannel()
-                        val totalBytes = response.headers[io.ktor.http.HttpHeaders.ContentLength]?.toLongOrNull() ?: downloadInfo.size
-                        var downloadedBytes = 0L
-                        // The callback drives UI state that is copied on every write,
-                        // and an 8KB buffer means thousands of writes for one jar - so
-                        // it fires on whole-percent steps only. The flow keeps its
-                        // per-chunk resolution, which nothing re-renders.
-                        var lastPercent = -1
+                    val targetFile = File(targetPath)
+                    val stagedFile = File(targetFile.parentFile ?: File("."), "${targetFile.name}.part")
 
-                        File(targetPath).outputStream().use { output ->
-                            val buffer = ByteArray(8192)
-                            while (!channel.isClosedForRead) {
-                                val bytes = channel.readAvailable(buffer)
-                                if (bytes > 0) {
-                                    output.write(buffer, 0, bytes)
-                                    downloadedBytes += bytes
-                                    if (totalBytes > 0) {
-                                        val fraction = downloadedBytes.toFloat() / totalBytes
-                                        progressFlow.value = fraction
-                                        val percent = ((downloadedBytes * 100) / totalBytes).toInt()
-                                        if (percent != lastPercent) {
-                                            lastPercent = percent
-                                            onProgress?.invoke(fraction)
+                    try {
+                        // Download with progress tracking into staged file
+                        downloadHttpClient.prepareGet(downloadInfo.downloadUrl).execute { response ->
+                            val channel = response.bodyAsChannel()
+                            val totalBytes = response.headers[io.ktor.http.HttpHeaders.ContentLength]?.toLongOrNull() ?: downloadInfo.size
+                            var downloadedBytes = 0L
+                            // The callback drives UI state that is copied on every write,
+                            // and an 8KB buffer means thousands of writes for one jar - so
+                            // it fires on whole-percent steps only. The flow keeps its
+                            // per-chunk resolution, which nothing re-renders.
+                            var lastPercent = -1
+
+                            stagedFile.outputStream().use { output ->
+                                val buffer = ByteArray(8192)
+                                while (!channel.isClosedForRead) {
+                                    val bytes = channel.readAvailable(buffer)
+                                    if (bytes > 0) {
+                                        output.write(buffer, 0, bytes)
+                                        downloadedBytes += bytes
+                                        if (totalBytes > 0) {
+                                            val fraction = downloadedBytes.toFloat() / totalBytes
+                                            progressFlow.value = fraction
+                                            val percent = ((downloadedBytes * 100) / totalBytes).toInt()
+                                            if (percent != lastPercent) {
+                                                lastPercent = percent
+                                                onProgress?.invoke(fraction)
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Verify SHA-256 — every published version must have a real
-                    // hash. A blank or placeholder value is treated as a mismatch
-                    // so tampered or unhashed JARs never load.
-                    val actualSha256 = FileHashing.sha256(File(targetPath))
-                    if (!actualSha256.equals(downloadInfo.sha256, ignoreCase = true)) {
-                        deleteOrWarn(File(targetPath), "hash-mismatched download")
-                        throw DownloadException(
-                            "SHA-256 mismatch. Expected: ${downloadInfo.sha256}, Got: $actualSha256",
-                            pluginId,
-                            id,
+                        // Verify SHA-256 — every published version must have a real
+                        // hash. A blank or placeholder value is treated as a mismatch
+                        // so tampered or unhashed JARs never load.
+                        val actualSha256 = FileHashing.sha256(stagedFile)
+                        if (!actualSha256.equals(downloadInfo.sha256, ignoreCase = true)) {
+                            deleteOrWarn(stagedFile, "hash-mismatched download")
+                            throw DownloadException(
+                                "SHA-256 mismatch. Expected: ${downloadInfo.sha256}, Got: $actualSha256",
+                                pluginId,
+                                id,
+                            )
+                        }
+
+                        // Verify the store's signature over that hash. The checksum
+                        // above binds the local bytes to the hash; the signature binds
+                        // the hash to the store's signing key, so a rewritten DB row
+                        // or storage object can't smuggle a different JAR through.
+                        enforceStoreSignature(
+                            sha256 = actualSha256,
+                            signature = downloadInfo.signature,
+                            pluginId = pluginId,
+                            versionLabel = downloadInfo.version,
+                            requestedVersion = version,
+                            onVerificationFailure = { deleteOrWarn(stagedFile, "rejected download") },
                         )
+
+                        // Verification passed cleanly. Promote staged file to final target file.
+                        promoteStagedFile(stagedFile, targetFile)
+
+                        // Persist the signature beside the JAR so load-time
+                        // verification (which every install path funnels through) can
+                        // re-check it independently of this download path.
+                        PluginSignatureSidecar.persist(targetPath, downloadInfo.signature)
+
+                        // Cache the downloaded JAR
+                        cacheOrNull("write") { downloadCache.cacheJar(pluginId, downloadInfo.version, targetFile) }
+
+                        progressFlow.value = 1f
+                        onProgress?.invoke(1f)
+
+                        logger.info(
+                            LogCategory.NETWORK,
+                            "Plugin downloaded successfully",
+                            mapOf(
+                                "pluginId" to pluginId,
+                                "version" to downloadInfo.version,
+                                "path" to targetPath,
+                            ),
+                        )
+
+                        targetPath
+                    } finally {
+                        if (stagedFile.exists()) {
+                            deleteOrWarn(stagedFile, "unpromoted staged download")
+                        }
                     }
-
-                    // Verify the store's signature over that hash. The checksum
-                    // above binds the local bytes to the hash; the signature binds
-                    // the hash to the store's signing key, so a rewritten DB row
-                    // or storage object can't smuggle a different JAR through.
-                    enforceStoreSignature(
-                        sha256 = actualSha256,
-                        signature = downloadInfo.signature,
-                        pluginId = pluginId,
-                        versionLabel = downloadInfo.version,
-                        requestedVersion = version,
-                        onVerificationFailure = { deleteOrWarn(File(targetPath), "rejected download") },
-                    )
-
-                    // Persist the signature beside the JAR so load-time
-                    // verification (which every install path funnels through) can
-                    // re-check it independently of this download path.
-                    PluginSignatureSidecar.persist(targetPath, downloadInfo.signature)
-
-                    // Cache the downloaded JAR
-                    cacheOrNull("write") { downloadCache.cacheJar(pluginId, downloadInfo.version, File(targetPath)) }
-
-                    progressFlow.value = 1f
-                    onProgress?.invoke(1f)
-
-                    logger.info(
-                        LogCategory.NETWORK,
-                        "Plugin downloaded successfully",
-                        mapOf(
-                            "pluginId" to pluginId,
-                            "version" to downloadInfo.version,
-                            "path" to targetPath,
-                        ),
-                    )
-
-                    targetPath
                 } finally {
                     // Two-arg remove: if a concurrent download of another version
                     // of the same plugin replaced our entry (progress is keyed by

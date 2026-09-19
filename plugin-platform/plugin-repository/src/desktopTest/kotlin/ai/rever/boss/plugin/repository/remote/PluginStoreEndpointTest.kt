@@ -17,7 +17,8 @@ class PluginStoreEndpointTest {
         HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/") { exchange ->
                 requests.add("${exchange.requestMethod} ${exchange.requestURI}")
-                exchange.sendResponseHeaders(404, -1)
+                exchange.sendResponseHeaders(404, 0)
+                exchange.responseBody.close()
                 exchange.close()
             }
             start()
