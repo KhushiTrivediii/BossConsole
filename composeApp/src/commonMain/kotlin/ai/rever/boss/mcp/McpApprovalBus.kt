@@ -59,6 +59,7 @@ data class McpApprovalRequest(
     val riskAssessment: McpRiskAssessment? = null,
     val requestedAt: Long = System.currentTimeMillis(),
     val deferred: CompletableDeferred<McpApprovalDecision> = CompletableDeferred(),
+    val readOnly: Boolean? = null,
 )
 
 /**
@@ -87,13 +88,15 @@ open class McpApprovalBus(
      * Suspends the calling coroutine until the operator answers via the UI
      * or [timeoutMs] elapses (in which case it fails closed).
      */
-    @Suppress("ReturnCount") // Both active and delivery queues must reject overflow before awaiting an answer.
+    // Both active and delivery queues must reject overflow before awaiting an answer.
+    @Suppress("ReturnCount", "LongParameterList")
     suspend fun requestApproval(
         toolName: String,
         providerId: String,
         arguments: Map<String, Any?>,
         timeoutMs: Long = defaultTimeoutMs,
         riskAssessment: McpRiskAssessment? = null,
+        readOnly: Boolean? = null,
     ): McpApprovalDecision {
         val request =
             McpApprovalRequest(
@@ -102,6 +105,7 @@ open class McpApprovalBus(
                 arguments = McpArgumentSanitizer.sanitize(arguments),
                 timeoutMs = timeoutMs,
                 riskAssessment = riskAssessment,
+                readOnly = readOnly,
             )
 
         synchronized(lock) {
