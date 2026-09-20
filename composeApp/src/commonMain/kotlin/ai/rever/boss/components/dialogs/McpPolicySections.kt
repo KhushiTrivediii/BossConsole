@@ -44,7 +44,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 
 internal fun McpToolIdentity.isViewTool(): Boolean =
-    readOnly && !McpMutatingToolCatalog.isMutating(toolName) && policyRisk(this).level < McpRiskLevel.HIGH
+    readOnly && !McpMutatingToolCatalog.isMutating(toolName, readOnly) && policyRisk(this).level < McpRiskLevel.HIGH
 
 internal fun sectionSelection(
     tools: List<McpToolIdentity>,

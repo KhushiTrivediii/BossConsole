@@ -745,7 +745,7 @@ internal class McpToolRegistryCore(
                 ?: return McpToolResult("Unknown or disabled MCP tool: $toolName", isError = true)
         val args = parseArgs(arguments)
         val revocation = policyEngine.revocationVersion(toolName, tool.providerId)
-        val policy = policyEngine.policyFor(toolName, tool.providerId)
+        val policy = policyEngine.policyFor(toolName, tool.providerId, readOnly = tool.definition.readOnly)
         val startTime = System.nanoTime()
         var disposition = McpApprovalDisposition.AUTO_ALLOWED
         var result: McpToolResult? = null
@@ -963,6 +963,7 @@ internal class McpToolRegistryCore(
                             tool.providerId,
                             McpArgumentSanitizer.parseArguments(args.raw),
                             riskAssessment = DefaultMcpRiskEvaluator().evaluateRisk(tool.definition.name, args),
+                            readOnly = tool.definition.readOnly,
                         )
                 ) {
                     is McpApprovalDecision.Approved -> {
