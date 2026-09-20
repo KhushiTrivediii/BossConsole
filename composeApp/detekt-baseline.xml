@@ -1080,7 +1080,7 @@
     <ID>ReturnCount:BrowserFunctions.kt$actual fun isBrowserValid(browser: Any?): Boolean</ID>
     <ID>ReturnCount:BrowserFunctions.kt$actual fun recreateBrowserViewState( browser: Any, window: Any?, ): Any?</ID>
     <ID>ReturnCount:BrowserServiceImpl.kt$BrowserServiceImpl$override fun deleteProfile(profileName: String): Boolean</ID>
-    <ID>ReturnCount:CLICommandHandler.kt$CLICommandHandler$private suspend fun handleLoadWorkspace(configPath: String)</ID>
+    <ID>ReturnCount:CLICommandHandler.kt$CLICommandHandler$private suspend fun handleLoadWorkspace(command: CLICommand.LoadWorkspace)</ID>
     <ID>ReturnCount:CLICommandHandler.kt$CLICommandHandler$private suspend fun handleOpenFile(filePath: String)</ID>
     <ID>ReturnCount:CLICommandHandler.kt$CLICommandHandler$private suspend fun handleOpenFolder(folderPath: String)</ID>
     <ID>ReturnCount:CLIInstaller.kt$CLIInstaller$private fun installHomebrewStyle(): CLIInstallResult</ID>

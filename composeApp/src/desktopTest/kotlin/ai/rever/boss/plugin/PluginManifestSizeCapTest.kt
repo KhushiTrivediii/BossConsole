@@ -58,7 +58,8 @@ class PluginManifestSizeCapTest {
     @Test
     fun testValidManifestIsReadSuccessfully() {
         val validJson =
-            """{"pluginId": "com.example.test", "displayName": "Test", "version": "1.0.0", "apiVersion": "1.0.0", "mainClass": "com.example.Test"}"""
+            """{"pluginId": "com.example.test", "displayName": "Test", """ +
+                """"version": "1.0.0", "apiVersion": "1.0.0", "mainClass": "com.example.Test"}"""
         val jarFile = createJarWithManifest(validJson)
 
         val manifest = PluginManifestReader.readFromJar(jarFile.absolutePath)

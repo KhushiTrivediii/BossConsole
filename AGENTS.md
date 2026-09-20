@@ -780,7 +780,7 @@ restart. There is no Settings row and no per-site exclusion.
   bridge. Project paths routinely contain usernames, so this widens *when* a filesystem
   path reaches every installed plugin, not *what* - the same install-time-gating stance
   as the bus above applies. In particular, `boss://` links can originate outside BOSS and
-  every non-terminal deep link currently bypasses `DeepLinkOrigin` confirmation, so an
+  only a deep link that would start a terminal command consults `DeepLinkOrigin`, so an
   externally opened project link can trigger this broadcast without operator confirmation.
   It is recorded here because this paragraph is the canonical list of what a third-party
   plugin can observe.
@@ -934,11 +934,23 @@ URL produces the same input. Entry points therefore tag each link with a
   Also the default for an unstated origin, so a new caller that forgets to say
   gets the cautious handling.
 
-Only `boss://terminal?command=` consults it today: an `OPERATOR_CLI` command runs
-as before, anything else is shown to the operator for confirmation first (the
-`boss` shell shim converts to a `boss://` URL and opens it via the OS, so its
-`terminal -c` still works, with one confirmation). Other hosts - including
-`boss://plugin?id=…&action=…` - are unchanged.
+Two hosts consult it, and both for the same reason - each can type a command
+into a shell:
+
+- `boss://terminal?command=`: an `OPERATOR_CLI` command runs as before, anything
+  else is shown to the operator for confirmation first (the `boss` shell shim
+  converts to a `boss://` URL and opens it via the OS, so its `terminal -c` still
+  works, with one confirmation).
+- `boss://workspace?path=`: a Space's terminal tabs run their `initialCommand`
+  when it is applied, so an `EXTERNAL` load of a Space that carries any is held
+  (`spaceLoadDisposition`) and `SpaceLoadApprovalDialog` lists every command
+  before anything loads. A Space with no terminal commands, and the operator's
+  own `boss workspace`, load as before. The origin rides on
+  `CLICommand.LoadWorkspace` through the cold-start readiness queue to
+  `WorkspaceLoadEvent.requiresConfirmation`, because only the window parses the
+  file and so only it knows whether there is anything to confirm.
+
+Other hosts - including `boss://plugin?id=…&action=…` - are unchanged.
 
 **Single-instance channel**: `SingleInstanceManager` publishes
 `~/.boss/run/single-instance` (owner-only) with the channel endpoint and a token

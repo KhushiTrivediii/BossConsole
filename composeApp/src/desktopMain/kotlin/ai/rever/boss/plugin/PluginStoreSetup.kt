@@ -124,7 +124,6 @@ internal suspend fun finishBackgroundSystemPluginUpdate(update: BackgroundSystem
 object PluginStoreSetup {
     private val logger = BossLogger.forComponent("PluginStoreSetup")
 
-    private val manifestJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
     private var initialized = false
 
     /**
