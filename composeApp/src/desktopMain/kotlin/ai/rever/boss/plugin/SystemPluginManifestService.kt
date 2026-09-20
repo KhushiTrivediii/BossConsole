@@ -176,9 +176,45 @@ object SystemPluginManifestService {
             }
 
     /**
-     * Merge remote rows over the built-in [FALLBACK] so a table edit can add
-     * plugins, retarget repos, raise version floors, or disable optional
-     * rows — but can never DROP a row this host build ships with, LOWER a
+     * Map of pluginId to its build-owned GitHub repo for every system plugin this
+     * build ships with (the [FALLBACK] set).
+     */
+    fun pinnedSystemPluginRepos(): Map<String, String> = FALLBACK.associate { it.pluginId to it.githubRepo }
+
+    /**
+     * F1 (system-plugin download pinning): returns the build-owned repository
+     * spelling when a `system_plugins` row may have its JAR auto-installed
+     * from GitHub, or `null` when it may not.
+     *
+     * `github_repo` reaches `PluginStoreSetup.downloadSystemPluginFromGitHub`
+     * verbatim from the remote table ([mergeWithFallback] overrides only
+     * `min_version` and `enabled`), and that method downloads without a hash or
+     * signature on the bytes - only non-emptiness. The store path binds its
+     * bytes to a sha256 plus a store signature (RemotePluginRepository);
+     * this path historically had nothing, so a rewritten or maliciously
+     * added row could point the host at ANY GitHub repo and have it install
+     * those bytes.
+     *
+     * Fail closed: installable only when the pluginId is one this host ships
+     * AND the repo is exactly the pinned repo for it. Unknown pluginIds (rows
+     * added via table edit) and retargeted repos are refused - rolling a repo
+     * forward now takes a host release, same as changing [FALLBACK] itself.
+     * Owner/repo comparison ignores case because GitHub serves those URLs
+     * identically. Whitespace and every other spelling are refused.
+     */
+    fun pinnedGithubRepoOrNull(
+        pluginId: String,
+        githubRepo: String,
+    ): String? =
+        pinnedSystemPluginRepos()[pluginId]?.takeIf { pinned ->
+            pinned.equals(githubRepo, ignoreCase = true)
+        }
+
+    /**
+     * Merge remote rows over the built-in [FALLBACK] so a table edit can propose
+     * plugins or repos, raise version floors, or disable optional rows. GitHub
+     * installation later refuses ids and repos not pinned by this build. A row
+     * can never DROP a plugin this host build ships with, LOWER a
      * minVersion floor the build requires (e.g. the editortab 1.4.0 floor
      * that prevents NoClassDefFoundError with older jars), or disable a
      * [BOOTSTRAP_PLUGIN_IDS] row. Without this, a partial/fat-fingered edit
