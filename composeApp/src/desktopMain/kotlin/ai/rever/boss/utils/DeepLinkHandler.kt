@@ -407,7 +407,7 @@ actual object DeepLinkHandler {
     ): Deferred<Boolean>? {
         when (host) {
             DeepLinkHost.URL -> handleUrlLink(uri)
-            DeepLinkHost.WORKSPACE -> handleWorkspaceLink(uri)
+            DeepLinkHost.WORKSPACE -> handleWorkspaceLink(uri, origin)
             DeepLinkHost.FILE -> handleFileLink(uri)
             DeepLinkHost.TERMINAL -> handleTerminalLink(uri, origin)
             DeepLinkHost.FOLDER -> handleFolderLink(uri, targetWindowId)
@@ -733,27 +733,45 @@ actual object DeepLinkHandler {
      * Handle boss://workspace deep links
      * Examples:
      *   boss://workspace?path=/path/to/workspace.json
+     *
+     * A Space file can carry a terminal tab's `initialCommand`, which is typed into
+     * a shell when the Space is applied - the same thing `boss://terminal?command=`
+     * does. So [origin] travels with the load for the same reason it travels with a
+     * terminal command: a load that did not come from the operator's own `boss`
+     * invocation shows those commands before any of them run.
      */
-    private fun handleWorkspaceLink(uri: String) {
-        logger.debug(LogCategory.WORKSPACE, "Handling workspace link")
+    private fun handleWorkspaceLink(
+        uri: String,
+        origin: DeepLinkOrigin,
+    ) {
+        logger.debug(LogCategory.WORKSPACE, "Handling workspace link", mapOf("origin" to origin.name))
 
-        val params = parseQueryParams(uri)
-        val path = params["path"]?.urlDecode()
-
-        if (path == null) {
+        val cliCommand = workspaceLinkCommand(uri, origin)
+        if (cliCommand == null) {
             logger.warn(LogCategory.WORKSPACE, "Missing 'path' parameter in workspace deep link")
             return
         }
 
         // Queue command via CLI handler
-        val cliCommand =
-            ai.rever.boss.cli.CLICommand
-                .LoadWorkspace(path)
         ai.rever.boss.cli.CLICommandHandler
             .getInstance()
             .queueCommand(cliCommand)
 
-        logger.info(LogCategory.WORKSPACE, "Workspace command queued", mapOf("path" to path))
+        logger.info(
+            LogCategory.WORKSPACE,
+            "Workspace command queued",
+            mapOf("path" to cliCommand.configPath, "origin" to origin.name),
+        )
+    }
+
+    /** The load a `boss://workspace` link asks for, carrying [origin]; null without a `path`. */
+    internal fun workspaceLinkCommand(
+        uri: String,
+        origin: DeepLinkOrigin,
+    ): ai.rever.boss.cli.CLICommand.LoadWorkspace? {
+        val path = parseQueryParams(uri)["path"]?.urlDecode() ?: return null
+        return ai.rever.boss.cli.CLICommand
+            .LoadWorkspace(path, origin)
     }
 
     /**
