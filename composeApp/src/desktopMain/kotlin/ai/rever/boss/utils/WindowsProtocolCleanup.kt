@@ -280,7 +280,7 @@ internal object WindowsProtocolCleanup {
     internal fun maskUserPath(path: String?): String {
         if (path == null) return "(none)"
         return path
-            .replace(Regex("""(?i)(\\Users\\)([^\\"]+)"""), "$1***")
-            .replace(Regex("""(?i)(\\Documents and Settings\\)([^\\"]+)"""), "$1***")
+            .replace(Regex("""(?i)([\\/]Users[\\/])([^\\/"]+)"""), "$1***")
+            .replace(Regex("""(?i)([\\/]Documents and Settings[\\/])([^\\/"]+)"""), "$1***")
     }
 }

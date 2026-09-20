@@ -389,6 +389,14 @@ class WindowsProtocolCleanupTest {
             """C:\Documents and Settings\***\BOSS\BOSS.exe""",
             maskUserPath("""C:\Documents and Settings\me\BOSS\BOSS.exe"""),
         )
+        assertEquals(
+            "C:/Users/***/AppData/Local/BOSS/BOSS.exe",
+            maskUserPath("C:/Users/alice/AppData/Local/BOSS/BOSS.exe"),
+        )
+        assertEquals(
+            "C:/Documents and Settings/***/BOSS/BOSS.exe",
+            maskUserPath("C:/Documents and Settings/me/BOSS/BOSS.exe"),
+        )
         assertEquals(otherApp, maskUserPath(otherApp))
         assertEquals("(none)", maskUserPath(null))
     }
