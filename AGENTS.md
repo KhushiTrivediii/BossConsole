@@ -2059,7 +2059,13 @@ plugins. Unknown tool names default to ALLOW. Known mutations default to ASK wit
 a 45-second timeout. Each queued prompt is delivered to exactly one window and
 window teardown denies its owned request. Session trust is process-wide and can
 be cleared using “Revoke MCP session trust” in the bottom bar; restore the bar if
-it is hidden. The approval dialog offers Always Allow and Always Deny, which save
+it is hidden. Session trust is keyed to the exact provider the operator approved (#815): a same-named
+tool from a different provider gets its own ASK instead of inheriting the grant - the tool-name squat.
+McpSessionTrust keeps the (providerId, toolName) identity the engine uses everywhere else: a name-only
+grant would hand an unvetted plugin the approval its sibling earned, and trusting less than the operator
+meant is the fail-closed direction. Revocation stays name-wide as the operator escape hatch:
+revokeSessionTrust(toolName, providerId = null) still clears every provider's trust for that name, and
+over-removing trust fails closed. The approval dialog offers Always Allow and Always Deny, which save
 a tool-wide rule for all agents and arguments across restarts. Saved rules can be
 reviewed and reset from “Persisted MCP policies” in the bottom bar; a reset removes
 the rule and clears that tool's session trust, so the tool uses the configured default
@@ -2175,8 +2181,10 @@ confirms the displayed counts and scope. These are explicit tool-name rules,
 not provider trust: future tools are not automatically granted access.
 `McpPolicyEngine.setSectionPolicies` writes the reviewed section atomically,
 checks every prior rule and tool/provider revocation stamp, refuses provider DENY
-and unreadable policy files, and invalidates queued grants/session trust after a
-successful save. Keep these checks when changing section UI; sequential calls to
+and unreadable policy files, and invalidates queued grants after a
+successful save, dropping session trust only for the (providerId, toolName)
+pairs the write changed (#815); other providers' same-named grants survive.
+Keep these checks when changing section UI; sequential calls to
 `setToolPolicy` would permit partial application and stale overwrites. Individual
 reset controls remain available below the sections.
 
