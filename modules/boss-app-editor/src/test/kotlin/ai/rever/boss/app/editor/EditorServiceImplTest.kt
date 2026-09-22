@@ -6,6 +6,7 @@ import kotlinx.coroutines.runBlocking
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -163,5 +164,66 @@ class EditorServiceImplTest {
             val winPath = "C:\\Windows\\System32\\cmd.exe"
             val openWin = service.openFile(OpenFileRequest.newBuilder().setPath(winPath).build())
             assertFalse(openWin.success)
+        }
+
+    @Test
+    fun `saveFile surfaces a refused path as a failure, not a silent success`() =
+        runBlocking<Unit> {
+            // The response carries no error field, so a refused save must throw: a silent
+            // Empty would let the caller (and its autosave retry logic) believe the write held.
+            val refused =
+                assertFailsWith<IllegalArgumentException> {
+                    service.saveFile(
+                        ai.rever.boss.ipc.proto.services.SaveFileRequest
+                            .newBuilder()
+                            .setPath("/tmp/../etc/passwd")
+                            .setContent("must not be written")
+                            .build(),
+                    )
+                }
+            val message = refused.message.orEmpty()
+            assertTrue(
+                message.contains("not allowed") || message.contains("outside allowed roots"),
+                message,
+            )
+
+            // A save refused by the path gate must not touch anything on disk.
+            val file = Files.createTempFile("boss-editor-refused-", ".txt").toFile()
+            try {
+                file.writeText("untouched")
+                assertFailsWith<IllegalArgumentException> {
+                    service.saveFile(
+                        ai.rever.boss.ipc.proto.services.SaveFileRequest
+                            .newBuilder()
+                            .setPath("/etc/passwd")
+                            .setContent("must not be written")
+                            .build(),
+                    )
+                }
+                assertEquals("untouched", file.readText())
+            } finally {
+                file.delete()
+            }
+        }
+
+    @Test
+    fun `saveFile atomic write handles a one-character file name`() =
+        runBlocking<Unit> {
+            val dir = Files.createTempDirectory("boss-editor-onename").toFile()
+            try {
+                val oneChar = java.io.File(dir, "x")
+                service.saveFile(
+                    ai.rever.boss.ipc.proto.services.SaveFileRequest
+                        .newBuilder()
+                        .setPath(oneChar.absolutePath)
+                        .setContent("one-char ok")
+                        .build(),
+                )
+                assertEquals("one-char ok", oneChar.readText())
+                val strays = dir.listFiles()?.filter { it.name != "x" }.orEmpty()
+                assertTrue(strays.isEmpty(), "unexpected leftovers: ${strays.map { it.name }}")
+            } finally {
+                dir.deleteRecursively()
+            }
         }
 }

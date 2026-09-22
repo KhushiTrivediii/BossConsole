@@ -91,7 +91,10 @@ class EditorServiceImpl : EditorServiceGrpcKt.EditorServiceCoroutineImplBase() {
         content: String,
     ) {
         file.parentFile?.mkdirs()
-        val tempFile = File.createTempFile("${file.name}.", ".tmp", file.parentFile)
+        // createTempFile rejects a prefix under 3 characters, so a 1-character file name
+        // (prefix "x.") would throw before anything is written. Pad to the minimum.
+        val prefix = "${file.name}.".padEnd(3, '_')
+        val tempFile = File.createTempFile(prefix, ".tmp", file.parentFile)
         try {
             tempFile.writeText(content, Charsets.UTF_8)
             atomicMoveFrom(file, tempFile)
@@ -179,7 +182,10 @@ class EditorServiceImpl : EditorServiceGrpcKt.EditorServiceCoroutineImplBase() {
                 atomicWriteText(file, request.content)
                 openFiles[file.absolutePath] = false
             } catch (e: Exception) {
+                // A refused or failed save must reach the caller, not masquerade as success:
+                // the response carries no error field, so the failure is the exception.
                 logger.error("saveFile failed for {}: {}", request.path, e.message)
+                throw e
             }
             Empty.getDefaultInstance()
         }
