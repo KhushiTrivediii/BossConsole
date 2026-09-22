@@ -18,17 +18,16 @@ import java.util.concurrent.ConcurrentHashMap
  * this service handles routing and state management for multi-window
  * browser coordination over IPC.
  */
-@Suppress("TooManyFunctions")
 class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase() {
     private val logger = LoggerFactory.getLogger(BrowserServiceImpl::class.java)
 
     /**
-     * Routes URL logging through the shared userinfo redactor (#640) instead of a
-     * second regex dialect: it redacts at the LAST '@' in the authority, so a
-     * password containing '@' (user:p@ss@host) is removed whole rather than
-     * logging the tail.
+     * The only schemes a navigation may start with. `UrlOpenValidation` in the host
+     * process enforces the same allowlist on OS deep links, so the two readers agree:
+     * a denylist here would leave `file:`, `blob:`, `view-source:` and the like open
+     * in exactly the surface a compromised tool could reach.
      */
-    internal fun redactUrlUserInfo(text: String): String = LogSanitizer.redactUrlUserInfo(text)
+    private val allowedSchemePrefixes = listOf("http://", "https://")
 
     /** Per-window page state snapshot. */
     private data class PageState(
@@ -43,40 +42,57 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
     private val windowStates = ConcurrentHashMap<String, PageState>()
     private val navigationEvents = MutableSharedFlow<BrowserNavigationEvent>(extraBufferCapacity = 128)
 
-    private fun isProhibitedScheme(url: String): Boolean {
-        val lower = url.lowercase()
-        return lower.startsWith("javascript:") ||
-            lower.startsWith("data:") ||
-            lower.startsWith("vbscript:")
-    }
-
+    /**
+     * Refuses every scheme the host's [UrlOpenValidation] rule refuses, and the URL
+     * shapes that scheme bypasses: browsers strip ASCII tab and newline anywhere in
+     * a URL, so "java\tscript:" reaches the page as `javascript:` while a prefix
+     * test sees neither.
+     */
     private fun validateUrl(
         windowId: String,
         url: String,
         safeUrlForLogging: String,
-    ): String? =
-        when {
-            url.isBlank() -> {
-                "URL must not be blank"
-            }
-
-            isProhibitedScheme(url) -> {
-                logger.warn(
-                    "Refusing navigation to prohibited scheme: windowId={}, url={}",
-                    windowId,
-                    safeUrlForLogging,
-                )
-                "Prohibited URL scheme: javascript: and data: URLs are not allowed"
-            }
-
-            else -> {
-                null
-            }
+    ): String? {
+        if (url.isBlank()) return "URL must not be blank"
+        val scheme = allowedSchemePrefixes.firstOrNull { url.startsWith(it, ignoreCase = true) }
+        if (scheme == null) {
+            logger.warn(
+                "Refusing navigation with a non-http(s) scheme: windowId={}, url={}",
+                windowId,
+                safeUrlForLogging,
+            )
+            return "Only http:// and https:// URLs are allowed"
         }
+        val authorityEnd = url.indexOfAny(charArrayOf('/', '?', '#'), scheme.length)
+        val authority = url.substring(scheme.length, if (authorityEnd >= 0) authorityEnd else url.length)
+        if (authority.isEmpty() || authority.any { it in FORBIDDEN_IN_AUTHORITY || it.isISOControl() }) {
+            logger.warn(
+                "Refusing navigation with a malformed authority: windowId={}, url={}",
+                windowId,
+                safeUrlForLogging,
+            )
+            return "The URL authority is malformed"
+        }
+        // Credentials in the authority are how a link disguises its real destination
+        // ("https://apple.com@evil.example"); the host deep-link gate refuses them too.
+        if (authority.contains('@')) {
+            logger.warn(
+                "Refusing navigation with credentials in the authority: windowId={}, url={}",
+                windowId,
+                safeUrlForLogging,
+            )
+            return "Credentials are not allowed in the URL authority"
+        }
+        return null
+    }
+
+    /** Space, backslash and the like: the printable characters [UrlOpenValidation] bars from an authority. */
+    private val FORBIDDEN_IN_AUTHORITY = charArrayOf('\u0020', '\u00A0', '\\', '"', '<', '>')
 
     private fun emitNavEvent(
         windowId: String,
         url: String,
+        title: String,
         type: NavigationEventType,
         timestamp: Long,
     ) {
@@ -85,7 +101,7 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
                 .newBuilder()
                 .setWindowId(windowId)
                 .setUrl(url)
-                .setTitle(url)
+                .setTitle(title)
                 .setEventType(type)
                 .setTimestamp(timestamp)
                 .build(),
@@ -94,7 +110,7 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
 
     override suspend fun navigate(request: NavigateBrowserRequest): NavigateBrowserResponse {
         val url = request.url.trim()
-        val safeUrlForLogging = redactUrlUserInfo(url)
+        val safeUrlForLogging = LogSanitizer.redactUrlUserInfo(url)
         logger.info("navigate: windowId={}, url={}", request.windowId, safeUrlForLogging)
 
         val error = validateUrl(request.windowId, url, safeUrlForLogging)
@@ -118,8 +134,8 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
         windowStates[request.windowId] = newState
 
         val ts = System.currentTimeMillis()
-        emitNavEvent(request.windowId, url, NavigationEventType.NAVIGATION_EVENT_TYPE_STARTED, ts)
-        emitNavEvent(request.windowId, url, NavigationEventType.NAVIGATION_EVENT_TYPE_COMPLETED, ts + 1)
+        emitNavEvent(request.windowId, url, url, NavigationEventType.NAVIGATION_EVENT_TYPE_STARTED, ts)
+        emitNavEvent(request.windowId, url, url, NavigationEventType.NAVIGATION_EVENT_TYPE_COMPLETED, ts + 1)
 
         return NavigateBrowserResponse
             .newBuilder()
@@ -145,7 +161,7 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
         }
 
     override suspend fun getFavicon(request: GetFaviconRequest): GetFaviconResponse {
-        logger.debug("getFavicon: url={}", redactUrlUserInfo(request.url))
+        logger.debug("getFavicon: url={}", LogSanitizer.redactUrlUserInfo(request.url))
         return GetFaviconResponse
             .newBuilder()
             .setFaviconBytes(ByteString.EMPTY)
@@ -201,8 +217,8 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
         if (state != null) {
             windowStates[state.windowId] = state.copy(isLoading = false)
             val ts = System.currentTimeMillis()
-            emitNavEvent(state.windowId, state.url, NavigationEventType.NAVIGATION_EVENT_TYPE_STARTED, ts)
-            emitNavEvent(state.windowId, state.url, NavigationEventType.NAVIGATION_EVENT_TYPE_COMPLETED, ts + 1)
+            emitNavEvent(state.windowId, state.url, state.title, NavigationEventType.NAVIGATION_EVENT_TYPE_STARTED, ts)
+            emitNavEvent(state.windowId, state.url, state.title, NavigationEventType.NAVIGATION_EVENT_TYPE_COMPLETED, ts + 1)
         }
         return Empty.getDefaultInstance()
     }
