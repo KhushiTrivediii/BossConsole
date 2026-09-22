@@ -61,6 +61,23 @@ class BrowserServiceImplTest {
     }
 
     @Test
+    fun `a password containing an at sign is redacted whole, not up to the first at`() {
+        // The authority delimiter is the LAST '@', as in WHATWG URL parsing: stopping
+        // at the first one would log the credential tail "ss@host".
+        val raw = "https://user:p@ss@internal-host/path"
+        val safe = service.redactUrlUserInfo(raw)
+        assertEquals("https://[REDACTED]@internal-host/path", safe)
+        assertFalse(safe.contains("p@ss"))
+        assertFalse(safe.contains("user:"))
+    }
+
+    @Test
+    fun `an at sign outside a URL authority is left alone`() {
+        val raw = "mailto:someone@example.com"
+        assertEquals(raw, service.redactUrlUserInfo(raw))
+    }
+
+    @Test
     fun `reload does not leave page loading state stranded true`() =
         runBlocking<Unit> {
             service.navigate(

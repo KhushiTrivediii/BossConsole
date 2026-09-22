@@ -2,6 +2,7 @@ package ai.rever.boss.app.browser
 
 import ai.rever.boss.ipc.proto.Empty
 import ai.rever.boss.ipc.proto.services.*
+import ai.rever.boss.plugin.logging.LogSanitizer
 import com.google.protobuf.ByteString
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -21,9 +22,13 @@ import java.util.concurrent.ConcurrentHashMap
 class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase() {
     private val logger = LoggerFactory.getLogger(BrowserServiceImpl::class.java)
 
-    private val uriUserinfoPattern = Regex("""(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@""")
-
-    internal fun redactUrlUserInfo(text: String): String = text.replace(uriUserinfoPattern, "$1[REDACTED]@")
+    /**
+     * Routes URL logging through the shared userinfo redactor (#640) instead of a
+     * second regex dialect: it redacts at the LAST '@' in the authority, so a
+     * password containing '@' (user:p@ss@host) is removed whole rather than
+     * logging the tail.
+     */
+    internal fun redactUrlUserInfo(text: String): String = LogSanitizer.redactUrlUserInfo(text)
 
     /** Per-window page state snapshot. */
     private data class PageState(
