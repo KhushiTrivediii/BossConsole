@@ -3,10 +3,17 @@ package ai.rever.boss.app.editor
 import ai.rever.boss.ipc.proto.Empty
 import ai.rever.boss.ipc.proto.services.*
 import ai.rever.boss.plugin.language.LanguageIds
+import io.grpc.Status
+import io.grpc.StatusRuntimeException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermission
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -14,113 +21,175 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Provides real file I/O using the host filesystem:
  * - OpenFile: reads file from disk, detects language by extension
- * - SaveFile: writes content back to disk
+ * - SaveFile: writes content back to disk atomically (sibling temp + move)
  * - DetectMainFunctions: regex-based scan for entry points across multiple languages
  * - GetTokens / NavigateToDefinition: require PSI (in composeApp) — return empty
+ *
+ * Every path crosses the confinement gate in [validatePath] before any file I/O. The
+ * shipped roots are [user.home] and the system temp dir (#885); they are constructor
+ * parameters so tests (and an operator who wants a wider root) can override them.
+ * That policy is a decision, not an accident: widening it is a deliberate edit to
+ * [defaultAllowedRoots], not a silent relaxation.
+ *
+ * Failure conventions: [openFile] carries its error in the response (the proto has an
+ * error field); [saveFile] and [detectMainFunctions] throw — their responses have no
+ * error field, so a refused or failed call must be the exception. Gate refusals are
+ * gRPC [Status.INVALID_ARGUMENT], genuine I/O failures [Status.INTERNAL], so the
+ * client can tell "path refused" from "disk full" over the wire.
+ *
+ * [openFiles] is keyed by the canonical absolute path (not the request path), so
+ * [listOpenFiles] reports the real location behind symlinks; a client must look up by
+ * canonical path.
  */
 @Suppress("TooManyFunctions")
-class EditorServiceImpl : EditorServiceGrpcKt.EditorServiceCoroutineImplBase() {
+class EditorServiceImpl(
+    allowedRoots: List<String> = defaultAllowedRoots(),
+    blockedPrefixes: List<String> = defaultBlockedPrefixes(),
+) : EditorServiceGrpcKt.EditorServiceCoroutineImplBase() {
     private val logger = LoggerFactory.getLogger(EditorServiceImpl::class.java)
 
-    /** path → isDirty: tracks files opened in this session */
+    /** canonical path → isDirty: tracks files opened in this session */
     private val openFiles = ConcurrentHashMap<String, Boolean>()
 
-    private val blockedPrefixes: List<String> by lazy {
-        val list =
-            mutableListOf(
-                "/etc",
-                "/sys",
-                "/proc",
-                "/dev",
-                "/boot",
-                "/root",
-                "C:\\Windows",
-                "C:\\Program Files",
-                "C:\\Program Files (x86)",
-                "C:\\System Volume Information",
-            )
-        System.getenv("SystemRoot")?.let { list.add(it) }
-        System.getenv("WINDIR")?.let { list.add(it) }
-        list.map { runCatching { File(it).canonicalPath }.getOrDefault(it) }
-    }
+    private val allowedRoots: List<String> =
+        allowedRoots.map { runCatching { File(it).canonicalPath }.getOrDefault(it) }
 
-    private fun isSubpathOf(
+    /**
+     * Blocked prefixes are defense in depth under the allowlist. A prefix that is an
+     * allowed root itself is dropped, because denying it would refuse every file the
+     * policy explicitly allows (the running-as-root case where [user.home] is /root);
+     * a system subtree inside an allowed root still denies (fail closed).
+     */
+    private val blockedPrefixes: List<String> =
+        blockedPrefixes
+            .map { runCatching { File(it).canonicalPath }.getOrDefault(it) }
+            .filterNot { blocked ->
+                allowedRoots.any { it.equals(blocked, ignoreCase = IS_CASE_INSENSITIVE) }
+            }
+
+    private fun isSubpathOfCanonical(
         path: String,
         root: String,
     ): Boolean {
-        val normPath = runCatching { File(path).canonicalPath }.getOrDefault(path)
-        val normRoot = runCatching { File(root).canonicalPath }.getOrDefault(root)
-        return normPath.equals(normRoot, ignoreCase = true) ||
-            normPath.lowercase().startsWith(normRoot.lowercase() + File.separator.lowercase())
+        // Both arguments are already canonical (resolve-once at the call site). Windows
+        // and the default macOS volumes are case-insensitive; Linux case-sensitivity is
+        // preserved so /HOME/x does not read as /home/x.
+        val ignoreCase = IS_CASE_INSENSITIVE
+        return path.equals(root, ignoreCase = ignoreCase) ||
+            path.lowercase().startsWith(root.lowercase() + File.separator)
     }
 
+    private fun refuse(message: String): Nothing =
+        throw
+        Status.INVALID_ARGUMENT
+            .withDescription(message)
+            .asRuntimeException()
+
     private fun validatePath(rawPath: String): File {
-        require(!rawPath.contains("..")) { "Path traversal sequences ('..') are not allowed: $rawPath" }
+        // A `..` PATH COMPONENT is traversal; `..` inside a file name (notes..bak) is not.
+        val hasTraversal =
+            rawPath
+                .replace('\\', '/')
+                .split('/')
+                .any { it == ".." }
+        if (hasTraversal) {
+            refuse("Path traversal sequences ('..') are not allowed: $rawPath")
+        }
 
         val canonicalFile =
             try {
                 File(rawPath).canonicalFile
             } catch (e: Exception) {
-                throw IllegalArgumentException("Invalid or unresolvable path: $rawPath", e)
+                refuse("Invalid or unresolvable path: $rawPath (${e.message})")
             }
 
         val canonicalPath = canonicalFile.absolutePath
-        require(!canonicalPath.contains("..")) { "Canonical path traversal sequences ('..') are not allowed: $rawPath" }
 
-        val userHome = System.getProperty("user.home") ?: ""
-        val tempDir = System.getProperty("java.io.tmpdir") ?: ""
-
-        val isUnderHome = userHome.isNotEmpty() && isSubpathOf(canonicalPath, userHome)
-        val isUnderTemp = tempDir.isNotEmpty() && isSubpathOf(canonicalPath, tempDir)
-
-        require(isUnderHome || isUnderTemp) {
-            "Access denied: path '$rawPath' (canonical: '$canonicalPath') is outside allowed roots"
+        val underAnAllowedRoot = allowedRoots.any { isSubpathOfCanonical(canonicalPath, it) }
+        if (!underAnAllowedRoot) {
+            refuse("Access denied: path '$rawPath' (canonical: '$canonicalPath') is outside allowed roots")
         }
 
-        blockedPrefixes.forEach { prefix ->
-            require(!isSubpathOf(canonicalPath, prefix)) {
-                "Access to system path '$prefix' is not allowed: $rawPath"
-            }
+        blockedPrefixes.firstOrNull { isSubpathOfCanonical(canonicalPath, it) }?.let { prefix ->
+            refuse("Access to system path '$prefix' is not allowed: $rawPath")
         }
 
         return canonicalFile
     }
 
+    private fun ioFailure(
+        message: String,
+        cause: Throwable,
+    ): Nothing =
+        throw
+        Status.INTERNAL
+            .withDescription(message)
+            .withCause(cause)
+            .asRuntimeException()
+
+    private fun posixPermissions(path: java.nio.file.Path): Set<PosixFilePermission>? =
+        Files
+            .getFileAttributeView(path, PosixFileAttributeView::class.java)
+            ?.readAttributes()
+            ?.permissions()
+
     private fun atomicWriteText(
         file: File,
         content: String,
     ) {
-        file.parentFile?.mkdirs()
+        runCatching { file.parentFile?.mkdirs() }
+            .onFailure { ioFailure("Could not create parent directory for ${file.absolutePath}", it) }
         // createTempFile rejects a prefix under 3 characters, so a 1-character file name
         // (prefix "x.") would throw before anything is written. Pad to the minimum.
         val prefix = "${file.name}.".padEnd(3, '_')
         val tempFile = File.createTempFile(prefix, ".tmp", file.parentFile)
         try {
+            // Preserve the target's existing permissions (a 0600 source file must stay
+            // 0600); the temp file otherwise inherits the process umask, which on POSIX
+            // could widen a private file. New files keep the umask default.
+            if (file.exists()) {
+                val existing =
+                    runCatching { posixPermissions(file.canonicalFile.toPath()) }
+                        .onFailure { ioFailure("Could not read permissions for ${file.absolutePath}", it) }
+                        .getOrNull()
+                if (existing != null) {
+                    runCatching { Files.setPosixFilePermissions(tempFile.toPath(), existing) }
+                        .onFailure { ioFailure("Could not preserve permissions for ${file.absolutePath}", it) }
+                }
+            }
             tempFile.writeText(content, Charsets.UTF_8)
             atomicMoveFrom(file, tempFile)
+        } catch (e: StatusRuntimeException) {
+            throw e
+        } catch (e: IOException) {
+            ioFailure("Failed to write ${file.absolutePath}", e)
         } finally {
             tempFile.delete()
         }
     }
 
+    /**
+     * Move [temp] onto [target], replacing it. Same contract as the house
+     * `File.atomicMoveFrom` (composeApp `ai.rever.boss.utils.AtomicFileWrite` — kept in
+     * sync with it by hand; `composeApp` is not reachable from `modules/`):
+     * `renameTo` is wrong here because Win32 `MoveFile` refuses to overwrite an
+     * existing target, so `Files.move` + `REPLACE_EXISTING` is the portable form and
+     * `ATOMIC_MOVE` rules out a torn destination when the volume supports it.
+     */
     @Suppress("SwallowedException")
     private fun atomicMoveFrom(
         target: File,
         temp: File,
     ) {
         try {
-            java.nio.file.Files.move(
+            Files.move(
                 temp.toPath(),
                 target.toPath(),
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE,
             )
         } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-            java.nio.file.Files.move(
-                temp.toPath(),
-                target.toPath(),
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-            )
+            Files.move(temp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
         }
     }
 
@@ -177,16 +246,17 @@ class EditorServiceImpl : EditorServiceGrpcKt.EditorServiceCoroutineImplBase() {
     override suspend fun saveFile(request: SaveFileRequest): Empty =
         withContext(Dispatchers.IO) {
             logger.info("saveFile: path={}", request.path)
+            val file = validatePath(request.path)
+            // A refused or failed save must reach the caller, not masquerade as success:
+            // the response carries no error field, so the failure is the exception
+            // (INVALID_ARGUMENT for a refused path, INTERNAL for a failed write).
             try {
-                val file = validatePath(request.path)
                 atomicWriteText(file, request.content)
-                openFiles[file.absolutePath] = false
-            } catch (e: Exception) {
-                // A refused or failed save must reach the caller, not masquerade as success:
-                // the response carries no error field, so the failure is the exception.
-                logger.error("saveFile failed for {}: {}", request.path, e.message)
+            } catch (e: StatusRuntimeException) {
+                logger.error("saveFile refused/failed for {}: {}", request.path, e.message)
                 throw e
             }
+            openFiles[file.absolutePath] = false
             Empty.getDefaultInstance()
         }
 
@@ -205,13 +275,9 @@ class EditorServiceImpl : EditorServiceGrpcKt.EditorServiceCoroutineImplBase() {
     override suspend fun detectMainFunctions(request: DetectMainRequest): DetectMainResponse =
         withContext(Dispatchers.IO) {
             logger.info("detectMainFunctions: path={}", request.path)
-            val file =
-                try {
-                    validatePath(request.path)
-                } catch (e: Exception) {
-                    logger.warn("detectMainFunctions path validation failed: {}", e.message)
-                    return@withContext DetectMainResponse.newBuilder().build()
-                }
+            // The response has no error field: a refused path throws (INVALID_ARGUMENT)
+            // rather than masquerading as "this file has no entry points".
+            val file = validatePath(request.path)
             if (!file.exists() || !file.isFile) return@withContext DetectMainResponse.newBuilder().build()
 
             val functions = mutableListOf<MainFunctionInfo>()
@@ -267,4 +333,48 @@ class EditorServiceImpl : EditorServiceGrpcKt.EditorServiceCoroutineImplBase() {
             "proto" -> "protobuf"
             else -> LanguageIds.forExtension(ext) ?: "plaintext"
         }
+
+    companion object {
+        /** Windows and the default macOS volumes are case-insensitive; Linux is not. */
+        private val IS_CASE_INSENSITIVE: Boolean =
+            System
+                .getProperty("os.name", "")
+                .startsWith("windows", ignoreCase = true) ||
+                System.getProperty("os.name", "").startsWith("mac", ignoreCase = true)
+
+        /**
+         * The shipped confinement policy (#885): the user's home and the system temp dir.
+         * Deliberately narrow — a project outside both (an external volume, /srv, a WSL
+         * mount) is refused, which is the point of the gate. Override via the constructor
+         * when a wider root is intended.
+         */
+        private fun defaultAllowedRoots(): List<String> =
+            listOfNotNull(
+                System.getProperty("user.home"),
+                System.getProperty("java.io.tmpdir"),
+            )
+
+        /**
+         * Defense in depth under the allowlist (mirrors `FileSystemPathPolicy`'s blocked
+         * roots in `modules/boss-service-filesystem` — kept in sync by hand). The Windows
+         * roots and `SystemRoot`/`WINDIR` are read only on Windows, like that policy.
+         */
+        private fun defaultBlockedPrefixes(): List<String> {
+            val list =
+                mutableListOf(
+                    "/etc",
+                    "/sys",
+                    "/proc",
+                    "/dev",
+                    "/boot",
+                    "/root",
+                )
+            if (System.getProperty("os.name", "").startsWith("windows", ignoreCase = true)) {
+                list += listOf("C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)")
+                System.getenv("SystemRoot")?.let { list.add(it) }
+                System.getenv("WINDIR")?.let { list.add(it) }
+            }
+            return list
+        }
+    }
 }

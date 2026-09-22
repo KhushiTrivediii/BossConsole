@@ -2,8 +2,13 @@ package ai.rever.boss.app.editor
 
 import ai.rever.boss.ipc.proto.services.OpenFileRequest
 import ai.rever.boss.plugin.language.LanguageIds
+import io.grpc.Status
+import io.grpc.StatusRuntimeException
 import kotlinx.coroutines.runBlocking
+import java.io.File
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFileAttributeView
+import java.nio.file.attribute.PosixFilePermission
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -155,52 +160,151 @@ class EditorServiceImplTest {
     @Test
     fun `path traversal and system paths are refused`() =
         runBlocking<Unit> {
-            val openDotDot = service.openFile(OpenFileRequest.newBuilder().setPath("/tmp/../etc/passwd").build())
-            assertFalse(openDotDot.success)
+            // The gate is proven with an explicit policy and REAL paths so the refusal is
+            // deterministic on every OS: an allowed root with a blocked system subtree inside
+            // it, mirroring the shipped home+blocked-prefix shape.
+            val allowedRoot = Files.createTempDirectory("editor-gate-").toFile()
+            val systemSubtree = File(allowedRoot, "fake-system")
+            systemSubtree.mkdirs()
+            val inSystem = File(systemSubtree, "cmd.exe")
+            inSystem.writeText("system file")
+            val inAllowed = File(allowedRoot, "ok.txt")
+            inAllowed.writeText("fine")
+            try {
+                val gated =
+                    EditorServiceImpl(
+                        allowedRoots = listOf(allowedRoot.absolutePath),
+                        blockedPrefixes = listOf(systemSubtree.absolutePath),
+                    )
 
-            val openEtc = service.openFile(OpenFileRequest.newBuilder().setPath("/etc/passwd").build())
-            assertFalse(openEtc.success)
+                // Traversal is a refusal (the gate fires), never a read.
+                val traversalPath = allowedRoot.absolutePath + "/../fake-system/cmd.exe"
+                val openDotDot = gated.openFile(OpenFileRequest.newBuilder().setPath(traversalPath).build())
+                assertFalse(openDotDot.success)
+                assertTrue(openDotDot.errorMessage.contains("not allowed"), openDotDot.errorMessage)
 
-            val winPath = "C:\\Windows\\System32\\cmd.exe"
-            val openWin = service.openFile(OpenFileRequest.newBuilder().setPath(winPath).build())
-            assertFalse(openWin.success)
+                // A path under a blocked system prefix is a GATE refusal ("system path"),
+                // even though the file exists and is inside the allowed root - not a
+                // "File not found".
+                val openSystem = gated.openFile(OpenFileRequest.newBuilder().setPath(inSystem.absolutePath).build())
+                assertFalse(openSystem.success)
+                assertTrue(openSystem.errorMessage.contains("system path"), openSystem.errorMessage)
+
+                // A path outside the allowed root is a GATE refusal ("outside allowed roots").
+                val openOutside = gated.openFile(OpenFileRequest.newBuilder().setPath("/etc/passwd").build())
+                assertFalse(openOutside.success)
+                assertTrue(openOutside.errorMessage.contains("outside allowed roots"), openOutside.errorMessage)
+
+                // And a path inside the allowed root, outside the blocked subtree, still opens.
+                val openOk = gated.openFile(OpenFileRequest.newBuilder().setPath(inAllowed.absolutePath).build())
+                assertTrue(openOk.success, openOk.errorMessage)
+            } finally {
+                allowedRoot.deleteRecursively()
+            }
         }
 
     @Test
-    fun `saveFile surfaces a refused path as a failure, not a silent success`() =
+    fun `a file name with two dots but no traversal component is allowed`() =
+        runBlocking<Unit> {
+            // "notes..bak" is a legitimate name: only a `..` PATH COMPONENT is traversal.
+            val file = Files.createTempFile("notes..", ".bak").toFile()
+            try {
+                file.writeText("backup")
+                val response = service.openFile(OpenFileRequest.newBuilder().setPath(file.absolutePath).build())
+                assertTrue(response.success, response.errorMessage)
+                assertEquals("backup", response.content)
+            } finally {
+                file.delete()
+            }
+        }
+
+    @Test
+    fun `saveFile surfaces a refused path as a gRPC INVALID_ARGUMENT, not a silent success`() =
         runBlocking<Unit> {
             // The response carries no error field, so a refused save must throw: a silent
             // Empty would let the caller (and its autosave retry logic) believe the write held.
-            val refused =
-                assertFailsWith<IllegalArgumentException> {
-                    service.saveFile(
-                        ai.rever.boss.ipc.proto.services.SaveFileRequest
-                            .newBuilder()
-                            .setPath("/tmp/../etc/passwd")
-                            .setContent("must not be written")
-                            .build(),
-                    )
-                }
-            val message = refused.message.orEmpty()
-            assertTrue(
-                message.contains("not allowed") || message.contains("outside allowed roots"),
-                message,
-            )
-
-            // A save refused by the path gate must not touch anything on disk.
-            val file = Files.createTempFile("boss-editor-refused-", ".txt").toFile()
+            // Over the wire it must be INVALID_ARGUMENT with a description, not the
+            // message-less UNKNOWN that a raw IllegalArgumentException becomes.
+            val root = Files.createTempDirectory("editor-allow-").toFile()
+            val outside = Files.createTempDirectory("editor-outside-").toFile()
+            val strictService = EditorServiceImpl(allowedRoots = listOf(root.absolutePath))
             try {
-                file.writeText("untouched")
-                assertFailsWith<IllegalArgumentException> {
+                val target = File(outside, "outside.txt")
+                target.writeText("untouched")
+
+                // Traversal is refused before any I/O.
+                val refusedTraversal =
+                    assertFailsWith<StatusRuntimeException> {
+                        strictService.saveFile(
+                            ai.rever.boss.ipc.proto.services.SaveFileRequest
+                                .newBuilder()
+                                .setPath("${root.absolutePath}/../${outside.name}/outside.txt")
+                                .setContent("must not be written")
+                                .build(),
+                        )
+                    }
+                assertEquals(Status.Code.INVALID_ARGUMENT, refusedTraversal.status.code)
+
+                // A save whose target is an EXISTING file outside the allowed root is
+                // refused, and that file must be byte-for-byte untouched - the gate is the
+                // only thing between the write and the user's document.
+                val refused =
+                    assertFailsWith<StatusRuntimeException> {
+                        strictService.saveFile(
+                            ai.rever.boss.ipc.proto.services.SaveFileRequest
+                                .newBuilder()
+                                .setPath(target.absolutePath)
+                                .setContent("must not be written")
+                                .build(),
+                        )
+                    }
+                assertEquals(Status.Code.INVALID_ARGUMENT, refused.status.code)
+                assertEquals("untouched", target.readText())
+
+                // A refused save leaves no temp sibling behind in the target's directory.
+                val strays = outside.listFiles { f -> f.name.endsWith(".tmp") }.orEmpty()
+                assertTrue(strays.isEmpty(), "temp leftovers: ${strays.map { it.name }}")
+            } finally {
+                root.deleteRecursively()
+                outside.deleteRecursively()
+            }
+        }
+
+    @Test
+    fun `saveFile preserves the existing file's permissions on POSIX`() =
+        runBlocking<Unit> {
+            val file = Files.createTempFile("boss-editor-perms-", ".txt").toFile()
+            try {
+                file.writeText("initial")
+                val posixView = Files.getFileAttributeView(file.toPath(), PosixFileAttributeView::class.java)
+                if (posixView != null) {
+                    val ownerOnly =
+                        setOf(
+                            PosixFilePermission.OWNER_READ,
+                            PosixFilePermission.OWNER_WRITE,
+                        )
+                    Files.setPosixFilePermissions(file.toPath(), ownerOnly)
                     service.saveFile(
                         ai.rever.boss.ipc.proto.services.SaveFileRequest
                             .newBuilder()
-                            .setPath("/etc/passwd")
-                            .setContent("must not be written")
+                            .setPath(file.absolutePath)
+                            .setContent("updated, still private")
                             .build(),
                     )
+                    assertEquals("updated, still private", file.readText())
+                    // The atomic move must not widen a 0600 document to the umask default.
+                    assertEquals(ownerOnly, Files.getPosixFilePermissions(file.toPath()))
+                } else {
+                    // Non-POSIX filesystem (Windows CI): the save still succeeds.
+                    service.saveFile(
+                        ai.rever.boss.ipc.proto.services.SaveFileRequest
+                            .newBuilder()
+                            .setPath(file.absolutePath)
+                            .setContent("updated")
+                            .build(),
+                    )
+                    assertEquals("updated", file.readText())
                 }
-                assertEquals("untouched", file.readText())
             } finally {
                 file.delete()
             }
