@@ -69,6 +69,12 @@ object McpArgumentSanitizer {
      * so the rule cannot cross a newline (the same convention the authorization rule above
      * pins), and the matched separator is echoed back so the sanitized text stays a faithful
      * rendering of the command being approved.
+     *
+     * Deliberately different from the URI rule: the URI userinfo goes whole
+     * (postgres://[REDACTED]@host) while the username is kept here
+     * (-u admin:[REDACTED]), because the operator judging WHICH account a curl call
+     * authenticates as is the exact information this dialog is for. Do not 'fix' one to
+     * match the other.
      */
     private val basicAuthFlagPattern =
         Regex(
