@@ -150,6 +150,8 @@ class McpPolicyEngine(
         declaredReadOnly: Boolean? = null,
     ): Boolean =
         synchronized(lock) {
+            // DENY-only consult: args are deliberately omitted because no risk level can produce
+            // a DENY, and the argument-aware CRITICAL gate lives at the invoke level (#895).
             if (revocationVersion(toolName, providerId) != expectedRevocation ||
                 policyFor(toolName, providerId, declaredReadOnly) == McpPolicyAction.DENY
             ) {
@@ -202,10 +204,14 @@ class McpPolicyEngine(
      * whatever its name says (#804); without it the name-only catalog decides, as before.
      *
      * [args] is the invocation's real arguments, threaded into the risk evaluator at the
-     * default-resolution step so the decision is argument-aware: a shell tool whose command
-     * matches a destructive pattern classifies as CRITICAL rather than the blanket HIGH an
-     * empty-args evaluation produces (#895). Callers without arguments in hand (tests, policy
-     * inspector lookups) omit it and get the previous empty-args behaviour.
+     * default-resolution step so the evaluation there is argument-aware: a shell tool whose
+     * command matches a destructive pattern classifies as CRITICAL rather than the blanket
+     * HIGH an empty-args evaluation produces (#895). Today this does not change [McpPolicyAction]
+     * for any catalog tool - the only args-sensitive branch is the shell evaluator, and an
+     * empty-args shell tool is already HIGH, which (like CRITICAL) takes the same mutating
+     * default - but the CRITICAL gate at the invoke level (#895) is where the real-args
+     * result matters. Callers without arguments in hand (tests, policy inspector lookups)
+     * omit it and get the previous empty-args behaviour.
      */
     @Suppress("ReturnCount") // Ordered deny, trust, tool-rule, provider-rule and default precedence.
     fun policyFor(

@@ -853,6 +853,7 @@ internal class McpToolRegistryCore(
             val toolName = tool.definition.name
             if (!isAvailable(tool) ||
                 policyEngine.revocationVersion(toolName, tool.providerId) != revocation ||
+                // DENY-only consult - no args: no risk level produces DENY (#895).
                 policyEngine.policyFor(toolName, tool.providerId, tool.definition.readOnly) == McpPolicyAction.DENY
             ) {
                 return@withContext McpApprovalDisposition.POLICY_DENIED to
@@ -871,6 +872,7 @@ internal class McpToolRegistryCore(
             }
             val disposition =
                 if (policyEngine.revocationVersion(toolName, tool.providerId) != revocation ||
+                    // DENY-only consult - no args: no risk level produces DENY (#895).
                     policyEngine.policyFor(toolName, tool.providerId, tool.definition.readOnly) == McpPolicyAction.DENY
                 ) {
                     McpApprovalDisposition.POLICY_DENIED
@@ -895,6 +897,7 @@ internal class McpToolRegistryCore(
             // since this check alone is not atomic with the write that follows it.
             if (!isAvailable(tool) ||
                 policyEngine.revocationVersion(toolName, tool.providerId) != revocation ||
+                // DENY-only consult - no args: no risk level produces DENY (#895).
                 policyEngine.policyFor(toolName, tool.providerId, tool.definition.readOnly) == McpPolicyAction.DENY
             ) {
                 return McpApprovalDisposition.POLICY_DENIED to
@@ -923,6 +926,7 @@ internal class McpToolRegistryCore(
             // (PROVIDER_TRUST_PERSIST_FAILED) - the former must not run at all, exactly the
             // disambiguation validateApproval already does for the per-tool path.
             return if (policyEngine.revocationVersion(toolName, tool.providerId) != revocation ||
+                // DENY-only consult - no args: no risk level produces DENY (#895).
                 policyEngine.policyFor(toolName, tool.providerId, tool.definition.readOnly) == McpPolicyAction.DENY
             ) {
                 McpApprovalDisposition.POLICY_DENIED to "MCP tool access revoked while awaiting approval"

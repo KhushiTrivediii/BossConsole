@@ -3,6 +3,7 @@ package ai.rever.boss.components.dialogs
 import ai.rever.boss.mcp.McpApprovalRequest
 import ai.rever.boss.mcp.McpArgumentSanitizer
 import ai.rever.boss.mcp.McpMutatingToolCatalog
+import ai.rever.boss.mcp.sandbox.McpRiskLevel
 import ai.rever.boss.plugin.ui.BossDialog
 import ai.rever.boss.plugin.ui.BossTheme
 import androidx.compose.foundation.background
@@ -216,6 +217,25 @@ fun McpApprovalDialog(
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
                         text = "⚠ This tool performs mutations or external execution.",
+                        fontSize = 11.sp,
+                        color = colors.alert,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+
+                // #895: a standing grant (persisted ALLOW, provider trust, session trust,
+                // read-only default) was escalated back to ASK because the evaluator rated this
+                // invocation CRITICAL. The persistent grants below are therefore not honored
+                // for CRITICAL calls - say so instead of letting an operator write a grant the
+                // registry re-asks past on every call.
+                val escalatedCritical = request.riskAssessment?.level == McpRiskLevel.CRITICAL
+                if (escalatedCritical) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text =
+                            "This invocation is rated CRITICAL, so no standing grant covers it: " +
+                                "Allowing it (or the Always/Trust options below) does not stop the next " +
+                                "CRITICAL call from asking again.",
                         fontSize = 11.sp,
                         color = colors.alert,
                         fontWeight = FontWeight.Medium,

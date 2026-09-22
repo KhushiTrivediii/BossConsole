@@ -2133,10 +2133,18 @@ the fault flow withholds all tools until recovery. No automatic quarantine UI is
 provided. Ledger redaction is bounded and best effort, not a guarantee for secrets
 under arbitrary keys. Queue overflow and cancellation before/after dispatch have
 distinct ledger dispositions. Risk classification from #336 feeds this same policy and approval path; there is
-no second sandbox prompt. Explicit policies and session trust retain precedence.
-HIGH/CRITICAL risk names use the mutating default alongside catalog-mutating
-and provider-declared mutating names, while everything else remains allowed
-by default. Risk reasons and sanitized arguments appear together in the existing
+no second sandbox prompt. Explicit policies and session trust retain precedence
+EXCEPT that standing grants (persisted ALLOW, provider trust, session trust,
+read-only default) never suppress the prompt for a CRITICAL invocation (#895):
+`invoke` re-evaluates risk with the invocation's real arguments before the ALLOW
+branch and escalates any CRITICAL back to ASK, so the operator reviews the
+specific arguments even though a grant exists. Name-CRITICAL tools
+(`secret_get`, the catalog's Docker/K8s destructive tools - #495 flags that
+catalog as over-broad) therefore never auto-run under any standing grant: a
+persisted ALLOW or provider trust on one is not inert, it is simply re-asked on
+every call, and the dialog says so. HIGH/CRITICAL risk names use the mutating
+default alongside catalog-mutating and provider-declared mutating names, while
+everything else remains allowed by default. Risk reasons and sanitized arguments appear together in the existing
 approval dialog. #362 is closed pending extraction into a management plugin.
 
 The workspace/terminal lifecycle tools (`WorkspaceMcpToolProvider`: open_workspace,

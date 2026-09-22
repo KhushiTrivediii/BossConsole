@@ -7,6 +7,8 @@ import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolHandler
 import ai.rever.boss.plugin.api.McpToolProvider
 import ai.rever.boss.plugin.api.McpToolResult
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import java.io.File
 import kotlin.test.AfterTest
@@ -111,6 +113,11 @@ class McpCriticalReAskTest {
         return File(dir, "mcp-disabled-tools.json").also { tempFiles.add(it) }
     }
 
+    /**
+     * A standing-ALLOW escalation test with a real operator on the bus: short approval timeout
+     * (no 45 s default), the prompt's actual appearance in [McpApprovalBus.pendingList] is what
+     * pins the escalation, and the ledger record shows the post-escalation ASK policy.
+     */
     @Test
     fun `standing ALLOW with CRITICAL args escalates to ASK and prompts operator`() =
         runBlocking {
@@ -120,20 +127,50 @@ class McpCriticalReAskTest {
             engine.setToolPolicy("run_command", McpPolicyAction.ALLOW)
             assertEquals(McpPolicyAction.ALLOW, engine.policyFor("run_command", "terminal-tab"))
 
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var handlerCalled = false
             val core =
                 McpToolRegistryCore(
                     disabledFile = tempDisabledFile(),
                     policyEngine = engine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
                 )
-            core.registerProvider(provider("terminal-tab", echoTool("run_command")))
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        name = "run_command",
+                        handler =
+                            McpToolHandler {
+                                handlerCalled = true
+                                McpToolResult("ok:run_command")
+                            },
+                    ),
+                ),
+            )
 
             // A destructive command that the risk evaluator rates CRITICAL
-            val result = core.invoke("run_command", """{"command":"rm -rf /"}""")
+            val call = async { core.invoke("run_command", """{"command":"rm -rf /"}""") }
 
-            // The call should NOT auto-allow: it should be blocked or prompted.
-            // Without an operator to approve (no UI in test), the approval times out.
+            // The escalation IS the prompt: no operator answer yet, so the call must be suspended
+            // on the bus, and the request must carry the CRITICAL assessment that triggered it.
+            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            assertEquals("run_command", request.toolName)
+            assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
+
+            approvalBus.deny(request.id, "denied by test")
+
+            val result = call.await()
             assertTrue(result.isError, "CRITICAL command under standing ALLOW must not auto-execute")
-            assertFalse(result.text.contains("ok:run_command"), "Handler must not run for escalated CRITICAL")
+            assertTrue(result.text.contains("denied by test"), result.text)
+            assertFalse(handlerCalled, "Handler must not run for escalated CRITICAL")
+
+            // The ledger records the post-escalation policy, not the standing ALLOW.
+            val record = ledger.recentOperations.value.single()
+            assertEquals(McpPolicyAction.ASK, record.policyApplied)
+            assertEquals(McpApprovalDisposition.DENIED_BY_OPERATOR, record.approvalDisposition)
         }
 
     @Test
@@ -143,19 +180,21 @@ class McpCriticalReAskTest {
             val engine = McpPolicyEngine(policyFile = policyFile)
             engine.setToolPolicy("run_command", McpPolicyAction.ALLOW)
 
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
             val core =
                 McpToolRegistryCore(
                     disabledFile = tempDisabledFile(),
                     policyEngine = engine,
+                    approvalBus = approvalBus,
                 )
             core.registerProvider(provider("terminal-tab", echoTool("run_command")))
 
-            // A benign command that the risk evaluator rates HIGH (not CRITICAL)
+            // HIGH is not CRITICAL — standing ALLOW still applies and no prompt may be raised
             val result = core.invoke("run_command", """{"command":"ls -la"}""")
 
-            // HIGH is not CRITICAL — standing ALLOW still applies
             assertFalse(result.isError, "Non-CRITICAL command under standing ALLOW should auto-execute")
             assertTrue(result.text.contains("ok:run_command"), "Handler should run for non-CRITICAL")
+            assertTrue(approvalBus.pendingList.value.isEmpty(), "no prompt may be raised for HIGH")
         }
 
     @Test
@@ -167,17 +206,37 @@ class McpCriticalReAskTest {
             engine.trustForSession("run_command", "terminal-tab")
             assertEquals(McpPolicyAction.ALLOW, engine.policyFor("run_command", "terminal-tab"))
 
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            var handlerCalled = false
             val core =
                 McpToolRegistryCore(
                     disabledFile = tempDisabledFile(),
                     policyEngine = engine,
+                    approvalBus = approvalBus,
                 )
-            core.registerProvider(provider("terminal-tab", echoTool("run_command")))
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        name = "run_command",
+                        handler =
+                            McpToolHandler {
+                                handlerCalled = true
+                                McpToolResult("ok:run_command")
+                            },
+                    ),
+                ),
+            )
 
-            val result = core.invoke("run_command", """{"command":"git push --force"}""")
+            val call = async { core.invoke("run_command", """{"command":"git push --force"}""") }
 
+            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
+            approvalBus.deny(request.id, "denied by test")
+
+            val result = call.await()
             assertTrue(result.isError, "CRITICAL command under session trust must not auto-execute")
-            assertFalse(result.text.contains("ok:run_command"), "Handler must not run for escalated CRITICAL")
+            assertFalse(handlerCalled, "Handler must not run for escalated CRITICAL")
         }
 
     @Test
@@ -188,31 +247,37 @@ class McpCriticalReAskTest {
             // "Trust this plugin" — provider-wide ALLOW
             engine.setProviderPolicy("terminal-tab", McpPolicyAction.ALLOW)
 
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            var handlerCalled = false
             val core =
                 McpToolRegistryCore(
                     disabledFile = tempDisabledFile(),
                     policyEngine = engine,
+                    approvalBus = approvalBus,
                 )
-            core.registerProvider(provider("terminal-tab", echoTool("run_command")))
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        name = "run_command",
+                        handler =
+                            McpToolHandler {
+                                handlerCalled = true
+                                McpToolResult("ok:run_command")
+                            },
+                    ),
+                ),
+            )
 
-            val result = core.invoke("run_command", """{"command":"mkfs.ext4 /dev/sda1"}""")
+            val call = async { core.invoke("run_command", """{"command":"mkfs.ext4 /dev/sda1"}""") }
 
+            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
+            approvalBus.deny(request.id, "denied by test")
+
+            val result = call.await()
             assertTrue(result.isError, "CRITICAL command under provider trust must not auto-execute")
-        }
-
-    @Test
-    fun `read-only tool with CRITICAL-severity args under read-only default still auto-allows`() =
-        runBlocking {
-            // secret_get is CRITICAL by name, so it gets the mutating default (ASK) —
-            // it never reaches ALLOW through the read-only path. This test pins that
-            // the escalation only fires on ALLOW, not on ASK.
-            val engine = McpPolicyEngine(policyFile = null)
-
-            // secret_get is CRITICAL → mutating default → ASK, never ALLOW
-            assertEquals(McpPolicyAction.ASK, engine.policyFor("secret_get"))
-
-            // git_status is read-only → ALLOW by default, no escalation needed
-            assertEquals(McpPolicyAction.ALLOW, engine.policyFor("git_status"))
+            assertFalse(handlerCalled, "Handler must not run for escalated CRITICAL")
         }
 
     @Test
@@ -223,17 +288,108 @@ class McpCriticalReAskTest {
             // Persist an ALLOW for secret_get (CRITICAL by name, not by args)
             engine.setToolPolicy("secret_get", McpPolicyAction.ALLOW)
 
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var handlerCalled = false
             val core =
                 McpToolRegistryCore(
                     disabledFile = tempDisabledFile(),
                     policyEngine = engine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
                 )
-            core.registerProvider(provider("terminal-tab", echoTool("secret_get")))
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        name = "secret_get",
+                        handler =
+                            McpToolHandler {
+                                handlerCalled = true
+                                McpToolResult("ok:secret_get")
+                            },
+                    ),
+                ),
+            )
 
             // Even with no args, secret_get is CRITICAL → must escalate to ASK
-            val result = core.invoke("secret_get", "{}")
+            val call = async { core.invoke("secret_get", "{}") }
 
+            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
+            approvalBus.deny(request.id, "denied by test")
+
+            val result = call.await()
             assertTrue(result.isError, "CRITICAL-by-name tool under standing ALLOW must escalate to ASK")
-            assertFalse(result.text.contains("ok:secret_get"), "Handler must not run for escalated CRITICAL")
+            assertFalse(handlerCalled, "Handler must not run for escalated CRITICAL")
+            assertEquals(
+                McpPolicyAction.ASK,
+                ledger.recentOperations.value
+                    .single()
+                    .policyApplied,
+            )
         }
+
+    @Test
+    fun `an operator-approved escalation still executes`() =
+        runBlocking {
+            val policyFile = createTempPolicyFile()
+            val engine = McpPolicyEngine(policyFile = policyFile)
+            engine.setToolPolicy("run_command", McpPolicyAction.ALLOW)
+
+            val approvalBus = McpApprovalBus(defaultTimeoutMs = 5000L)
+            val ledger = McpOperationLedger(ledgerFile = null)
+            var handlerCalled = false
+            val core =
+                McpToolRegistryCore(
+                    disabledFile = tempDisabledFile(),
+                    policyEngine = engine,
+                    approvalBus = approvalBus,
+                    ledger = ledger,
+                )
+            core.registerProvider(
+                provider(
+                    "terminal-tab",
+                    echoTool(
+                        name = "run_command",
+                        handler =
+                            McpToolHandler {
+                                handlerCalled = true
+                                McpToolResult("ok:run_command")
+                            },
+                    ),
+                ),
+            )
+
+            val call = async { core.invoke("run_command", """{"command":"rm -rf /"}""") }
+            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            approvalBus.approve(request.id)
+
+            // The escalation gates the call, it does not kill it: an explicit operator
+            // approval of the specific arguments must run.
+            val result = call.await()
+            assertFalse(result.isError, "approved escalation must execute")
+            assertTrue(result.text.contains("ok:run_command"))
+            assertTrue(handlerCalled)
+            assertEquals(
+                McpApprovalDisposition.APPROVED_ONCE,
+                ledger.recentOperations.value
+                    .single()
+                    .approvalDisposition,
+            )
+        }
+
+    @Test
+    fun `escalation only applies to ALLOW paths, not to the ASK default`() {
+        // secret_get is CRITICAL by name, so it gets the mutating default (ASK) —
+        // it never reaches ALLOW through the read-only path. This test pins that
+        // the escalation only fires on ALLOW, not on ASK.
+        val engine = McpPolicyEngine(policyFile = null)
+
+        // secret_get is CRITICAL → mutating default → ASK, never ALLOW
+        assertEquals(McpPolicyAction.ASK, engine.policyFor("secret_get"))
+
+        // git_status is read-only → ALLOW by default, no escalation needed
+        assertEquals(McpPolicyAction.ALLOW, engine.policyFor("git_status"))
+    }
 }
