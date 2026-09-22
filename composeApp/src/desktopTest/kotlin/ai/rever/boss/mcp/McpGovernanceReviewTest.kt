@@ -70,25 +70,27 @@ class McpGovernanceReviewTest {
 
     @Test
     fun `URI userinfo credentials, curl user flags, AWS keys, and PEM keys are redacted`() {
-        // Postgres URI authority password
+        // Postgres URI authority: the whole userinfo goes (shared #640 convention), host stays
+        // readable.
         val pg = McpArgumentSanitizer.sanitizeMessage("psql postgres://admin:hunter2@prod-db.example.invalid/app")
-        assertEquals("psql postgres://admin:[REDACTED]@prod-db.example.invalid/app", pg)
+        assertEquals("psql postgres://[REDACTED]@prod-db.example.invalid/app", pg)
 
         // MongoDB URI authority password
         val mongo =
             McpArgumentSanitizer.sanitizeMessage(
                 "mongosh mongodb+srv://svc:S3cr3tP%40ss@cluster.example.invalid/db",
             )
-        assertEquals("mongosh mongodb+srv://svc:[REDACTED]@cluster.example.invalid/db", mongo)
+        assertEquals("mongosh mongodb+srv://[REDACTED]@cluster.example.invalid/db", mongo)
 
-        // Redis URI authority password
+        // Redis URI authority password, with port
         val redis =
             McpArgumentSanitizer.sanitizeMessage(
                 "redis-cli -u redis://default:r3disPass@cache.example.invalid:6379",
             )
-        assertEquals("redis-cli -u redis://default:[REDACTED]@cache.example.invalid:6379", redis)
+        assertEquals("redis-cli -u redis://[REDACTED]@cache.example.invalid:6379", redis)
 
-        // Plain Redis URI without password must be left untouched
+        // Plain Redis URI without a credential must be left untouched: a naive pattern reads
+        // `cache` as a user and `6379` as a password.
         val redisPlain =
             McpArgumentSanitizer.sanitizeMessage("redis-cli -u redis://cache.example.invalid:6379")
         assertEquals("redis-cli -u redis://cache.example.invalid:6379", redisPlain)
@@ -98,19 +100,45 @@ class McpGovernanceReviewTest {
             McpArgumentSanitizer.sanitizeMessage(
                 "git clone https://user:hunter2@git.example.invalid/org/private.git",
             )
-        assertEquals("git clone https://user:[REDACTED]@git.example.invalid/org/private.git", git)
+        assertEquals("git clone https://[REDACTED]@git.example.invalid/org/private.git", git)
 
-        // curl -u credentials
+        // A password containing an at sign is removed whole: the LAST @ in the authority is the
+        // delimiter, so stopping at the first @ would leave `ss@host` behind.
+        val atInPassword =
+            McpArgumentSanitizer.sanitizeMessage("psql postgres://user:p@ss@db.example.invalid/app")
+        assertEquals("psql postgres://[REDACTED]@db.example.invalid/app", atInPassword)
+
+        // A colon and @ inside a path is not userinfo
+        val pathAt =
+            McpArgumentSanitizer.sanitizeMessage("curl https://api.example.invalid/a:b@c/d")
+        assertEquals("curl https://api.example.invalid/a:b@c/d", pathAt)
+
+        // curl -u credentials: the password is masked whole (it may contain colons)
         val curl = McpArgumentSanitizer.sanitizeMessage("curl -u admin:hunter2 https://api.example.invalid/health")
         assertEquals("curl -u admin:[REDACTED] https://api.example.invalid/health", curl)
+
+        val curlLongPassword = McpArgumentSanitizer.sanitizeMessage("curl --user admin:pa:ss word")
+        assertEquals("curl --user admin:[REDACTED] word", curlLongPassword)
+
+        // A bare URL after the flag is not user:pass
+        val curlUrl = McpArgumentSanitizer.sanitizeMessage("redis-cli -u http://cache.example.invalid:6379")
+        assertEquals("redis-cli -u http://cache.example.invalid:6379", curlUrl)
 
         // AWS Access Key ID
         val aws = McpArgumentSanitizer.sanitizeMessage("aws configure set key AKIAIOSFODNN7EXAMPLE")
         assertEquals("aws configure set key [REDACTED]", aws)
 
-        // PEM Private Key
-        val pem = McpArgumentSanitizer.sanitizeMessage("echo '-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEA'")
-        assertEquals("echo '[REDACTED]MIIEowIBAAKCAQEA'", pem)
+        // A full PEM private key block is masked, not just its header
+        val pemBlock =
+            McpArgumentSanitizer.sanitizeMessage(
+                "-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEA0body-----END RSA PRIVATE KEY-----",
+            )
+        assertEquals("[REDACTED]", pemBlock)
+
+        // A truncated fragment still masks the header to end of line (the over-masked
+        // closing quote is safe: a fragment that cannot be re-parsed is still secret)
+        val pemFragment = McpArgumentSanitizer.sanitizeMessage("echo '-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEA'")
+        assertEquals("echo '[REDACTED]", pemFragment)
     }
 
     @Test
