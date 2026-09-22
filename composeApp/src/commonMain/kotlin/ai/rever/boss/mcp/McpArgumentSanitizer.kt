@@ -32,28 +32,50 @@ object McpArgumentSanitizer {
                 ")",
         )
 
+    /**
+     * AWS access key IDs: `AKIA` (IAM users) and `ASIA` (temporary) plus 16 uppercase
+     * alphanumerics. The other ID prefixes (`AROA`, `AIDA`, ...) and the 40-char base64 secret
+     * access key are deliberately not matched: the secret shape is too false-positive-prone to
+     * mask blindly, and key names like `aws_secret_access_key` in a map are caught by the
+     * key-name rules instead.
+     */
     private val awsKeyPattern = Regex("""\b(?:AKIA|ASIA)[0-9A-Z]{16}\b""")
 
     /**
      * A PEM private key: the full BEGIN..END block when present, otherwise the header through the
      * end of the line (a truncated fragment is still the secret). The body, not the header, is
-     * what makes this material dangerous, so the whole match is replaced.
+     * what makes this material dangerous, so the whole match is replaced. GPG armor ends the
+     * marker with ` BLOCK` (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), so both markers allow an
+     * optional trailing ` BLOCK`. With `(?s)`, a truncated BEGIN scans lazily to the nearest
+     * later END anywhere in the string - deliberately over-masking, since the span between two
+     * key fragments is more likely to be secret than prose.
      */
     private val pemPrivateKeyPattern =
         Regex(
-            """(?s)-----BEGIN (?:[A-Z0-9-]+ )?PRIVATE KEY-----""" +
-                """(?:.*?-----END (?:[A-Z0-9-]+ )?PRIVATE KEY-----|[^\n]*)""",
+            """(?s)-----BEGIN (?:[A-Z0-9-]+ )?PRIVATE KEY(?: BLOCK)?-----""" +
+                """(?:.*?-----END (?:[A-Z0-9-]+ )?PRIVATE KEY(?: BLOCK)?-----|[^\n]*)""",
         )
 
     /**
-     * `curl -u user:secret` / `--user user:secret` (space or `=` form). The credential follows a
-     * flag, not a key name, so the key-name rules never see it. The username part may not contain
-     * `/`, `:` or `@`, which - with the `(?!//)` guard - keeps a bare URL argument
-     * (`-u http://host`) untouched; everything after the first colon is the password and is
-     * masked whole (a password may itself contain colons).
+     * `curl -u user:secret` and the equivalent spellings: `-u` takes a separated or an attached
+     * argument, `--user` a separated or `=` argument, so `--user=alice:pass` and `-ualice:pass`
+     * are caught as well. The credential follows a flag, not a key name, so the key-name rules
+     * never see it. The username may contain `@` (email usernames are the ordinary shape for
+     * SaaS basic auth) but not `/`, `:` or whitespace; everything after the first colon is the
+     * password and is masked whole (a password may itself contain `:` or `@`). The password must
+     * not start with `/` or `\`, which keeps a bare URL argument (`-u http://host`) and an
+     * rsync remote spec (`-u host:/srv/data`) readable - a file-copy destination is exactly the
+     * thing an operator needs to see before approving. The separator is `[ \t]`, never `\s`,
+     * so the rule cannot cross a newline (the same convention the authorization rule above
+     * pins), and the matched separator is echoed back so the sanitized text stays a faithful
+     * rendering of the command being approved.
      */
     private val basicAuthFlagPattern =
-        Regex("""(?i)(?<![A-Za-z0-9_-])(-u|--user)\s+([^:/\s@]+):(?!//)([^\s]*)""")
+        Regex(
+            """(?i)(?<![A-Za-z0-9_-])""" +
+                """(-u(?:[ \t]+|=[ \t]*|(?=[^\s:=]))?|--user(?:[ \t]+|=))""" +
+                """([^\s:=/]+):(?![/\\])(?:[^\s]*)""",
+        )
 
     /** Parse only for audit/approval; malformed input must never reach those surfaces verbatim. */
     @Suppress("TooGenericExceptionCaught") // Invalid nested JSON must not enter the audit surface verbatim.
@@ -137,6 +159,10 @@ object McpArgumentSanitizer {
             // URI authority userinfo is redacted by the shared #640 helper: the authority ends at
             // the first `/`, `?` or `#` and the LAST `@` is the delimiter, so a password
             // containing an `@` is removed whole (a local regex left its tail in the output).
+            // Known inherited limitation, accepted for this consent surface as for logs: a
+            // backslash does not end the authority (WHATWG), so
+            // `https://evil.example\@good.example/x` renders as
+            // `https://[REDACTED]@good.example/x`, hiding the host that was actually reached.
             .let(LogSanitizer::redactUrlUserInfo)
             .replace(credentialShapePattern, "[REDACTED]")
             .replace(awsKeyPattern, "[REDACTED]")
@@ -144,5 +170,5 @@ object McpArgumentSanitizer {
             .replace(sensitiveAssignment, "[REDACTED]")
             .replace(authorizationHeader, "[REDACTED]")
             .replace(bearer, "Bearer [REDACTED]")
-            .replace(basicAuthFlagPattern, "$1 $2:[REDACTED]")
+            .replace(basicAuthFlagPattern, "$1$2:[REDACTED]")
 }
