@@ -7,8 +7,20 @@ import com.google.protobuf.ByteString
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
+import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * The only schemes a navigation may start with. `UrlOpenValidation` in the host
+ * process enforces the same allowlist on OS deep links, so the two readers agree:
+ * a denylist here would leave `file:`, `blob:`, `view-source:` and the like open
+ * in exactly the surface a compromised tool could reach.
+ */
+private val ALLOWED_SCHEME_PREFIXES = listOf("http://", "https://")
+
+/** Space, backslash and the like: the printable characters [UrlOpenValidation] bars from an authority. */
+private val FORBIDDEN_IN_AUTHORITY = charArrayOf('\u0020', '\u00A0', '\\', '"', '<', '>')
 
 /**
  * gRPC implementation of BrowserService.
@@ -20,14 +32,6 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase() {
     private val logger = LoggerFactory.getLogger(BrowserServiceImpl::class.java)
-
-    /**
-     * The only schemes a navigation may start with. `UrlOpenValidation` in the host
-     * process enforces the same allowlist on OS deep links, so the two readers agree:
-     * a denylist here would leave `file:`, `blob:`, `view-source:` and the like open
-     * in exactly the surface a compromised tool could reach.
-     */
-    private val allowedSchemePrefixes = listOf("http://", "https://")
 
     /** Per-window page state snapshot. */
     private data class PageState(
@@ -53,41 +57,28 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
         url: String,
         safeUrlForLogging: String,
     ): String? {
-        if (url.isBlank()) return "URL must not be blank"
-        val scheme = allowedSchemePrefixes.firstOrNull { url.startsWith(it, ignoreCase = true) }
-        if (scheme == null) {
-            logger.warn(
-                "Refusing navigation with a non-http(s) scheme: windowId={}, url={}",
-                windowId,
-                safeUrlForLogging,
-            )
-            return "Only http:// and https:// URLs are allowed"
-        }
-        val authorityEnd = url.indexOfAny(charArrayOf('/', '?', '#'), scheme.length)
-        val authority = url.substring(scheme.length, if (authorityEnd >= 0) authorityEnd else url.length)
-        if (authority.isEmpty() || authority.any { it in FORBIDDEN_IN_AUTHORITY || it.isISOControl() }) {
-            logger.warn(
-                "Refusing navigation with a malformed authority: windowId={}, url={}",
-                windowId,
-                safeUrlForLogging,
-            )
-            return "The URL authority is malformed"
-        }
-        // Credentials in the authority are how a link disguises its real destination
-        // ("https://apple.com@evil.example"); the host deep-link gate refuses them too.
-        if (authority.contains('@')) {
-            logger.warn(
-                "Refusing navigation with credentials in the authority: windowId={}, url={}",
-                windowId,
-                safeUrlForLogging,
-            )
-            return "Credentials are not allowed in the URL authority"
-        }
-        return null
-    }
+        val scheme = ALLOWED_SCHEME_PREFIXES.firstOrNull { url.startsWith(it, ignoreCase = true) }
+        val error =
+            when {
+                url.isBlank() -> {
+                    "URL must not be blank"
+                }
 
-    /** Space, backslash and the like: the printable characters [UrlOpenValidation] bars from an authority. */
-    private val FORBIDDEN_IN_AUTHORITY = charArrayOf('\u0020', '\u00A0', '\\', '"', '<', '>')
+                scheme == null -> {
+                    logger.warn(
+                        "Refusing navigation with a non-http(s) scheme: windowId={}, url={}",
+                        windowId,
+                        safeUrlForLogging,
+                    )
+                    "Only http:// and https:// URLs are allowed"
+                }
+
+                else -> {
+                    authorityError(windowId, url, safeUrlForLogging, scheme.length, logger)
+                }
+            }
+        return error
+    }
 
     private fun emitNavEvent(
         windowId: String,
@@ -217,9 +208,63 @@ class BrowserServiceImpl : BrowserServiceGrpcKt.BrowserServiceCoroutineImplBase(
         if (state != null) {
             windowStates[state.windowId] = state.copy(isLoading = false)
             val ts = System.currentTimeMillis()
-            emitNavEvent(state.windowId, state.url, state.title, NavigationEventType.NAVIGATION_EVENT_TYPE_STARTED, ts)
-            emitNavEvent(state.windowId, state.url, state.title, NavigationEventType.NAVIGATION_EVENT_TYPE_COMPLETED, ts + 1)
+            emitNavEvent(
+                state.windowId,
+                state.url,
+                state.title,
+                NavigationEventType.NAVIGATION_EVENT_TYPE_STARTED,
+                ts,
+            )
+            emitNavEvent(
+                state.windowId,
+                state.url,
+                state.title,
+                NavigationEventType.NAVIGATION_EVENT_TYPE_COMPLETED,
+                ts + 1,
+            )
         }
         return Empty.getDefaultInstance()
+    }
+}
+
+/**
+ * Checks the authority of an http(s) URL whose scheme ends at [schemeLength].
+ *
+ * @return a refusal message, or null when the authority is well formed.
+ */
+private fun authorityError(
+    windowId: String,
+    url: String,
+    safeUrlForLogging: String,
+    schemeLength: Int,
+    logger: Logger,
+): String? {
+    val authorityEnd = url.indexOfAny(charArrayOf('/', '?', '#'), schemeLength)
+    val authority = url.substring(schemeLength, if (authorityEnd >= 0) authorityEnd else url.length)
+    return when {
+        authority.isEmpty() || authority.any { it in FORBIDDEN_IN_AUTHORITY || it.isISOControl() } -> {
+            logger.warn(
+                "Refusing navigation with a malformed authority: windowId={}, url={}",
+                windowId,
+                safeUrlForLogging,
+            )
+            "The URL authority is malformed"
+        }
+
+        // Credentials in the authority are how a link disguises its real
+        // destination ("https://apple.com@evil.example"); the host deep-link
+        // gate refuses them too.
+        authority.contains('@') -> {
+            logger.warn(
+                "Refusing navigation with credentials in the authority: windowId={}, url={}",
+                windowId,
+                safeUrlForLogging,
+            )
+            "Credentials are not allowed in the URL authority"
+        }
+
+        else -> {
+            null
+        }
     }
 }
