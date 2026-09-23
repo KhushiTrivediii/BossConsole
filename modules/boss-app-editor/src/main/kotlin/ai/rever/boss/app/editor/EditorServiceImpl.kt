@@ -73,10 +73,14 @@ class EditorServiceImpl(
     ): Boolean {
         // Both arguments are already canonical (resolve-once at the call site). Windows
         // and the default macOS volumes are case-insensitive; Linux case-sensitivity is
-        // preserved so /HOME/x does not read as /home/x.
-        val ignoreCase = IS_CASE_INSENSITIVE
-        return path.equals(root, ignoreCase = ignoreCase) ||
-            path.lowercase().startsWith(root.lowercase() + File.separator)
+        // preserved so /HOME/x does not read as /home/x - which means the prefix branch
+        // must fold ONLY when the filesystem does, on the allowlist side most of all.
+        return if (IS_CASE_INSENSITIVE) {
+            path.equals(root, ignoreCase = true) ||
+                path.lowercase().startsWith(root.lowercase() + File.separator)
+        } else {
+            path == root || path.startsWith(root + File.separator)
+        }
     }
 
     private fun refuse(message: String): Nothing =
@@ -139,14 +143,16 @@ class EditorServiceImpl(
     ) {
         runCatching { file.parentFile?.mkdirs() }
             .onFailure { ioFailure("Could not create parent directory for ${file.absolutePath}", it) }
-        // createTempFile rejects a prefix under 3 characters, so a 1-character file name
-        // (prefix "x.") would throw before anything is written. Pad to the minimum.
-        val prefix = "${file.name}.".padEnd(3, '_')
-        val tempFile = File.createTempFile(prefix, ".tmp", file.parentFile)
+        // java.nio createTempFile has no 3-character prefix minimum (the java.io one has,
+        // which forced a padding hack here) and creates the file 0600 on POSIX, so a private
+        // document's content is never briefly umask-wide as a sibling.
+        val tempFile = Files.createTempFile(file.parentFile.toPath(), file.name, ".tmp").toFile()
         try {
-            // Preserve the target's existing permissions (a 0600 source file must stay
-            // 0600); the temp file otherwise inherits the process umask, which on POSIX
-            // could widen a private file. New files keep the umask default.
+            tempFile.writeText(content, Charsets.UTF_8)
+            // Preserve the target's existing permissions (a 0600 source file must stay 0600),
+            // but only AFTER the write: applying them first would strip OWNER_WRITE from the
+            // temp for a read-only (0444/0400) target, and the save would fail with EACCES on
+            // a path that previously worked - the move replaces a read-only target regardless.
             if (file.exists()) {
                 val existing =
                     runCatching { posixPermissions(file.canonicalFile.toPath()) }
@@ -157,7 +163,6 @@ class EditorServiceImpl(
                         .onFailure { ioFailure("Could not preserve permissions for ${file.absolutePath}", it) }
                 }
             }
-            tempFile.writeText(content, Charsets.UTF_8)
             atomicMoveFrom(file, tempFile)
         } catch (e: StatusRuntimeException) {
             throw e

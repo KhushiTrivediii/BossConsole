@@ -311,6 +311,72 @@ class EditorServiceImplTest {
         }
 
     @Test
+    fun `saveFile over a read-only file succeeds and keeps it read-only`() =
+        runBlocking<Unit> {
+            val file = Files.createTempFile("boss-editor-readonly-", ".txt").toFile()
+            try {
+                file.writeText("initial")
+                val posixView = Files.getFileAttributeView(file.toPath(), PosixFileAttributeView::class.java)
+                if (posixView != null) {
+                    val readOnly = setOf(PosixFilePermission.OWNER_READ)
+                    Files.setPosixFilePermissions(file.toPath(), readOnly)
+                    service.saveFile(
+                        ai.rever.boss.ipc.proto.services.SaveFileRequest
+                            .newBuilder()
+                            .setPath(file.absolutePath)
+                            .setContent("updated despite read-only")
+                            .build(),
+                    )
+                    // The temp inherits the 0444 only AFTER the content is written; the move
+                    // replaces a read-only target regardless of its mode.
+                    assertEquals("updated despite read-only", file.readText())
+                    assertEquals(readOnly, Files.getPosixFilePermissions(file.toPath()))
+                }
+            } finally {
+                runCatching {
+                    Files.setPosixFilePermissions(
+                        file.toPath(),
+                        setOf(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE),
+                    )
+                }
+                file.delete()
+            }
+        }
+
+    @Test
+    fun `a case-variant sibling of an allowed root is refused on a case-sensitive filesystem`() =
+        runBlocking<Unit> {
+            val osName = System.getProperty("os.name", "")
+            val caseInsensitiveFs =
+                osName.startsWith("windows", ignoreCase = true) || osName.startsWith("mac", ignoreCase = true)
+            if (caseInsensitiveFs) return@runBlocking // there the variant IS the root
+
+            val parent = Files.createTempDirectory("boss-editor-case-").toFile()
+            try {
+                val root = File(parent, "allowed")
+                val variant = File(parent, "ALLOWED")
+                root.mkdirs()
+                variant.mkdirs()
+                val strictService = EditorServiceImpl(allowedRoots = listOf(root.absolutePath))
+                val trap = File(variant, "secret.txt")
+                trap.writeText("do not touch")
+
+                assertFailsWith<StatusRuntimeException> {
+                    strictService.saveFile(
+                        ai.rever.boss.ipc.proto.services.SaveFileRequest
+                            .newBuilder()
+                            .setPath(trap.absolutePath)
+                            .setContent("overwritten")
+                            .build(),
+                    )
+                }
+                assertEquals("do not touch", trap.readText())
+            } finally {
+                parent.deleteRecursively()
+            }
+        }
+
+    @Test
     fun `saveFile atomic write handles a one-character file name`() =
         runBlocking<Unit> {
             val dir = Files.createTempDirectory("boss-editor-onename").toFile()
