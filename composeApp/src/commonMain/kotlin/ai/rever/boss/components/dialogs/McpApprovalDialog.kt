@@ -228,16 +228,22 @@ fun McpApprovalDialog(
                 // invocation CRITICAL. The persistent grants below are therefore not honored
                 // for CRITICAL calls - say so instead of letting an operator write a grant the
                 // registry re-asks past on every call.
-                val escalatedCritical = request.riskAssessment?.level == McpRiskLevel.CRITICAL
-                if (escalatedCritical) {
+                // Keyed on the risk level, not on "was escalated": for a CRITICAL invocation
+                // any standing grant would have been escalated, so "no standing grant covers
+                // it" holds whether the prompt came from an escalated ALLOW or from the
+                // operator's own ASK rule. warn (not alert) so the CRITICAL risk line and
+                // the mutating warning above keep their alert color.
+                val criticalInvocation = request.riskAssessment?.level == McpRiskLevel.CRITICAL
+                if (criticalInvocation) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
                         text =
                             "This invocation is rated CRITICAL, so no standing grant covers it: " +
                                 "Allowing it (or the Always/Trust options below) does not stop the next " +
-                                "CRITICAL call from asking again.",
+                                "CRITICAL call from asking again. \"Trust This Plugin\" still takes " +
+                                "effect for this provider's other, non-CRITICAL tools.",
                         fontSize = 11.sp,
-                        color = colors.alert,
+                        color = colors.warn,
                         fontWeight = FontWeight.Medium,
                     )
                 }
