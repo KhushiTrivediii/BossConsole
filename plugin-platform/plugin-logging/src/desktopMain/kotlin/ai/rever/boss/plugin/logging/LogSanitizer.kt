@@ -106,7 +106,10 @@ object LogSanitizer {
 
     /**
      * Mask sensitive parameters in URIs.
-     * Redacts: token, access_token, refresh_token, code, error_description
+     * Redacts: token, access_token, refresh_token, code, error_description, id_token,
+     * session_token, api_key, key, secret, sessionId, email — name-matched
+     * case-insensitively, so the passkey ceremony's `sessionId` and the `email`
+     * beside it leave the log with the token names.
      *
      * Example:
      * "boss://auth?token=abc123&type=signup" -> "boss://auth?token=[REDACTED]&type=signup"
@@ -169,8 +172,13 @@ object LogSanitizer {
      * also ends at `&`, the outer query's separator, so a later `&contact=a@b.com` is not read as
      * its userinfo. With [freeText], every authority also ends at whitespace instead.
      *
+     * A protocol-relative authority, `//user:pass@host/path` with no scheme, is redacted too
+     * (BossConsole#1639): `Failed to connect to //alice:pass@10.0.0.5/x` otherwise reached
+     * `filePathPattern`, which stops at the userinfo colon and left the password in the line. Such a
+     * `//` counts only where a reference can begin - see [nextAuthorityStart] - so the `//` inside a
+     * path (`/a//b@c`) or after a third slash is not read as one.
+     *
      * Deliberately not handled, since the call sites log absolute URLs:
-     * - input without `://`, such as a protocol-relative `//user:pass@host/path`, is unchanged;
      * - a percent-encoded nested URL (`?next=https%3A%2F%2Fu%3Ap%40internal`) is unchanged, and a
      *   nested URL whose userinfo holds a literal `&` is not redacted;
      * - `\` does not end an authority. WHATWG parsing treats it as `/` in special schemes, so
@@ -184,9 +192,8 @@ object LogSanitizer {
         var out: StringBuilder? = null
         var copiedUpTo = 0
         var nested = false
-        var schemeEnd = text.indexOf("://")
-        while (schemeEnd >= 0) {
-            val authorityStart = schemeEnd + 3
+        var authorityStart = nextAuthorityStart(text, 0)
+        while (authorityStart >= 0) {
             val authorityEnd = findAuthorityEnd(text, authorityStart, freeText, ampersandEnds = nested && !freeText)
             val at = text.lastIndexOf('@', authorityEnd - 1)
             if (at >= authorityStart) {
@@ -196,9 +203,37 @@ object LogSanitizer {
                 copiedUpTo = at
             }
             nested = true
-            schemeEnd = text.indexOf("://", authorityEnd)
+            authorityStart = nextAuthorityStart(text, authorityEnd)
         }
         return out?.append(text, copiedUpTo, text.length)?.toString() ?: text
+    }
+
+    /**
+     * What may stand right before a protocol-relative `//`: the start of a quoted or bracketed
+     * reference, or of a value.
+     */
+    private val protocolRelativeOpeners = setOf('\'', '"', '`', '(', '[', '{', '<', '=', ',', ';')
+
+    /**
+     * The index just past the next `//` at or after [from] that starts an authority, or -1. That is
+     * every `://`, and a scheme-less `//` that begins a reference: at the start of [text], after
+     * whitespace, or after one of [protocolRelativeOpeners]. Anything else before it - a letter, a
+     * `/`, a `.` - means the `//` sits inside a path or a word, and a third `/` after it means an
+     * empty authority (`file:///x`), which has no userinfo to remove.
+     */
+    private fun nextAuthorityStart(
+        text: String,
+        from: Int,
+    ): Int {
+        var slashes = text.indexOf("//", from)
+        while (slashes >= 0) {
+            val before = text.getOrNull(slashes - 1)
+            val opensReference =
+                before == ':' || before == null || before.isWhitespace() || before in protocolRelativeOpeners
+            if (opensReference) return slashes + 2
+            slashes = text.indexOf("//", slashes + 1)
+        }
+        return -1
     }
 
     private fun findAuthorityEnd(
@@ -437,7 +472,13 @@ object LogSanitizer {
      * Runs of text that are a credential by their own structure, wherever they
      * appear: a JWT (three base64url segments — the first is the base64url of a
      * JSON header, which is why every JWT begins `eyJ`), a GitHub token prefix,
-     * or a vendor `sk_`/`pk_` key prefix.
+     * a vendor `sk_`/`pk_` key prefix, or a Supabase `sb_publishable_`/`sb_secret_` key.
+     *
+     * The Supabase branch names the two published prefixes rather than any
+     * `sb_`, so an ordinary identifier is not masked. `sb_secret_` is the
+     * service_role replacement and bypasses row-level security. This pattern is the
+     * original: it is duplicated in `McpArgumentSanitizer.credentialShapePattern` and
+     * pinned against this one by `McpArgumentSanitizerCredentialShapeTest`.
      *
      * Each alternative is anchored on the left by a boundary that rules out word
      * characters and `.`, so a name that merely *contains* one of these prefixes
@@ -452,6 +493,7 @@ object LogSanitizer {
                 """eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*""" +
                 "|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}" +
                 "|(?:sk|pk)[-_][A-Za-z0-9_-]{8,}" +
+                "|sb_(?:publishable|secret)_[A-Za-z0-9_-]{8,}" +
                 ")",
         )
 
@@ -501,6 +543,9 @@ object LogSanitizer {
     private val camelCaseBoundary = Regex("""(?<=[a-z0-9])(?=[A-Z])""")
 
     // Exact URL names stay separate: free-text exit_code and status_code are diagnostics.
+    // `sessionid` is the passkey ceremony's own query name (a UUID handle, not a
+    // `session_token` credential), and `email` rides along on the same WebAuthn URL
+    // the ceremony opens, so both must leave masked-URI log lines too.
     private val sensitiveUriParamNames =
         setOf(
             "token",
@@ -513,6 +558,8 @@ object LogSanitizer {
             "api_key",
             "key",
             "secret",
+            "sessionid",
+            "email",
         )
 
     /**
@@ -627,6 +674,15 @@ object LogSanitizer {
      * reason: it is the one pass that must see the *original* text, since its
      * whole job is removing a colon before [filePathPattern] can trip on it
      * (BossConsole#109). Running it any later would be too late by definition.
+     *
+     * [redactUrlUserInfo] runs next, and for the same reason. A URL's userinfo
+     * sits before the host, so [filePathPattern] reaches `//alice` first and
+     * leaves `http:[PATH]:pass@10.0.0.5:3128` - the password still in the line.
+     * It has to see the authority intact, so it goes ahead of the locations and
+     * behind the query pass, which does not touch an authority. Only the
+     * credential is removed; what survives is masked as a location as before.
+     * BossConsole#640 closed this for [maskUriParams] and recorded the free-text
+     * path as a separate change.
      */
     private fun redactLocationsAndCredentials(text: String): String {
         val withMaskedQueryParams =
@@ -642,7 +698,7 @@ object LogSanitizer {
             }
 
         val withoutLocations =
-            withMaskedQueryParams
+            redactUrlUserInfo(withMaskedQueryParams)
                 .replace(filePathPattern, "[PATH]")
                 .replace(urlPattern, "[URL]")
                 .replace(emailPattern, "[EMAIL]")
@@ -670,7 +726,7 @@ object LogSanitizer {
      * - URLs
      * - Email addresses
      * - Bare hostnames (no protocol/path around them - DNS and proxy-connect failures)
-     * - Credentials recognisable by shape: JWTs, GitHub tokens, `sk_`/`pk_` keys
+     * - Credentials recognisable by shape: JWTs, GitHub tokens, `sk_`/`pk_` keys, Supabase `sb_` keys
      * - The value of a `name=value` pair whose name marks it sensitive
      *
      * @param message The exception message to sanitize

@@ -23,12 +23,8 @@ import kotlin.test.assertTrue
  * session trust, or read-only default that produces ALLOW must escalate to ASK
  * when the invocation's real arguments drive the risk level to CRITICAL.
  *
- * Covers two layers:
- * 1. [McpPolicyEngine.policyFor] threads real [McpToolArgs] into the risk evaluator
- *    at the default-resolution step, so the default itself is argument-aware.
- * 2. [McpToolRegistryCore.invoke] re-evaluates risk with real args on ALLOW paths
- *    and escalates CRITICAL findings to ASK, so a standing ALLOW does not bypass
- *    human review for destructive commands.
+ * [McpToolRegistryCore.invoke] evaluates the real arguments on ALLOW paths and escalates
+ * CRITICAL findings to ASK, so a standing grant cannot bypass human review.
  */
 class McpCriticalReAskTest {
     private val tempFiles = mutableListOf<File>()
@@ -48,7 +44,7 @@ class McpCriticalReAskTest {
     }
 
     // ---------------------------------------------------------------------
-    // Layer 1: policyFor is argument-aware at the default-resolution step
+    // Risk evaluator classification and the unchanged default policy.
     // ---------------------------------------------------------------------
 
     @Test
@@ -59,36 +55,34 @@ class McpCriticalReAskTest {
     }
 
     @Test
-    fun `policyFor with destructive args evaluates run_command as CRITICAL`() {
+    fun `destructive args evaluate run_command as CRITICAL`() {
         val engine = McpPolicyEngine(policyFile = null)
         val destructiveArgs = McpToolArgs(mapOf("command" to "rm -rf /"), """{"command":"rm -rf /"}""")
         // With real args, the risk evaluator sees the destructive pattern → CRITICAL → ASK
         val risk = DefaultMcpRiskEvaluator().evaluateRisk("run_command", destructiveArgs)
         assertEquals(McpRiskLevel.CRITICAL, risk.level)
-        // CRITICAL >= HIGH, so the mutating default (ASK) applies — same result, but now
-        // the decision is argument-aware rather than blanket
-        assertEquals(McpPolicyAction.ASK, engine.policyFor("run_command", args = destructiveArgs))
+        assertEquals(McpPolicyAction.ASK, engine.policyFor("run_command"))
     }
 
     @Test
-    fun `policyFor with benign args still evaluates run_command as HIGH`() {
+    fun `benign args still evaluate run_command as HIGH`() {
         val engine = McpPolicyEngine(policyFile = null)
         val benignArgs = McpToolArgs(mapOf("command" to "ls -la"), """{"command":"ls -la"}""")
         val risk = DefaultMcpRiskEvaluator().evaluateRisk("run_command", benignArgs)
         assertEquals(McpRiskLevel.HIGH, risk.level)
-        assertEquals(McpPolicyAction.ASK, engine.policyFor("run_command", args = benignArgs))
+        assertEquals(McpPolicyAction.ASK, engine.policyFor("run_command"))
     }
 
     @Test
-    fun `policyFor with empty args is backward compatible`() {
+    fun `policyFor default remains backward compatible`() {
         val engine = McpPolicyEngine(policyFile = null)
-        // No args parameter → uses empty map, same as before #895
+        // Default policy is name based; the invocation gate handles argument risk.
         assertEquals(McpPolicyAction.ASK, engine.policyFor("run_command"))
         assertEquals(McpPolicyAction.ALLOW, engine.policyFor("git_status"))
     }
 
     // ---------------------------------------------------------------------
-    // Layer 2: standing ALLOW escalates CRITICAL to ASK in invoke()
+    // Standing ALLOW escalates CRITICAL to ASK in invoke().
     // ---------------------------------------------------------------------
 
     private fun provider(
