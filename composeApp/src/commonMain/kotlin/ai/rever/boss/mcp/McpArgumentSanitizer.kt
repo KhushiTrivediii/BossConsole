@@ -202,7 +202,8 @@ object McpArgumentSanitizer {
     private val basicAuthFlag =
         Regex(
             """(?i)(?<![A-Za-z0-9_-])""" +
-                """(-u(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=|(?=["']?[^ \t\r\n:=/'"\\]+:))|--(?:proxy-)?user(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=))""" +
+                """(-u(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=|(?=["']?[^ \t\r\n:=/'"\\]+:))|""" +
+                """--(?:proxy-)?user(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=))""" +
                 """(?!["']?[A-Za-z][A-Za-z0-9+.-]*://)(?!["']?$uidGidValue)""" +
                 """(?!["']?[^ \t\r\n:=/'"\\]+:[/\\])""" +
                 """(?:"[^"]*:[^"]*"|'[^']*:[^']*'|[^\s&,;}"']+:[^\s&,;}"']*)""",
@@ -235,7 +236,7 @@ object McpArgumentSanitizer {
     private val awsAccessKeyId = Regex("""(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])""")
     private val pemPrivateKey =
         Regex(
-                """-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----""" +
+            """-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----""" +
                 // RFC 1421 headers (Proc-Type:, DEK-Info:) sit between the BEGIN line and the
                 // base64 in a traditionally encrypted PEM, and they contain '-' - which the body
                 // class excludes. Without this arm the match stops at the headers and the whole
