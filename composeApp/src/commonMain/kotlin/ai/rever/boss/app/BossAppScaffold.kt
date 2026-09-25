@@ -3,6 +3,8 @@ package ai.rever.boss.app
 import ai.rever.boss.components.bars.horizontal.BossBottomBar
 import ai.rever.boss.components.bars.horizontal.BossTitleBar
 import ai.rever.boss.components.bars.horizontal.BossTopBar
+import ai.rever.boss.components.bars.horizontal.BottomBarHolds
+import ai.rever.boss.components.bars.horizontal.LocalBottomBarHolds
 import ai.rever.boss.components.bars.horizontal.setupKeepsBottomBarVisible
 import ai.rever.boss.components.bars.isBarVisible
 import ai.rever.boss.components.bars.vertical.BossLeftSideBar
@@ -266,6 +268,8 @@ internal fun BossAppScaffold(
     onToggleMaximize: (() -> Unit)?,
 ) {
     val setupNeedsBottomBar = setupKeepsBottomBarVisible()
+    // Per window: a dialog open from one window's bar must not hold another window's.
+    val bottomBarHolds = remember { BottomBarHolds() }
     val coroutineScope = state.coroutineScope
     val splitViewState = state.splitViewState
     val selectedProject by state.windowProjectState.selectedProject.collectAsState()
@@ -908,7 +912,12 @@ internal fun BossAppScaffold(
 
                 // Setup retains a visible home and its reopened dialog, including in focus mode.
                 AnimatedVisibility(
-                    visible = shouldShowBottomBar(setupNeedsBottomBar, appearance.showBottomBar, reveal.showBottomBar),
+                    visible =
+                        shouldShowBottomBar(
+                            heldVisible = setupNeedsBottomBar || bottomBarHolds.active,
+                            configuredVisible = appearance.showBottomBar,
+                            focusModeRevealed = reveal.showBottomBar,
+                        ),
                     enter =
                         expandVertically(
                             expandFrom = Alignment.Bottom,
@@ -923,7 +932,9 @@ internal fun BossAppScaffold(
                     Box(
                         modifier = Modifier.hoverable(interactionSource = reveal.bottomBarInteractionSource),
                     ) {
-                        BossBottomBar(splitViewState.getActiveTabsComponent())
+                        CompositionLocalProvider(LocalBottomBarHolds provides bottomBarHolds) {
+                            BossBottomBar(splitViewState.getActiveTabsComponent())
+                        }
                     }
                 }
             }
@@ -959,11 +970,16 @@ internal fun BossAppScaffold(
     }
 }
 
-private fun shouldShowBottomBar(
-    setupNeedsBottomBar: Boolean,
+/**
+ * [heldVisible] is something the bar is hosting right now - Terminal setup's reopened dialog, or a
+ * dialog opened from a bar item ([BottomBarHolds]) - and outranks focus mode's auto-hide, which
+ * would otherwise remove the bar and the dialog with it as soon as the pointer left the bar.
+ */
+internal fun shouldShowBottomBar(
+    heldVisible: Boolean,
     configuredVisible: Boolean,
     focusModeRevealed: Boolean,
-): Boolean = setupNeedsBottomBar || (configuredVisible && focusModeRevealed)
+): Boolean = heldVisible || (configuredVisible && focusModeRevealed)
 
 /**
  * Which plugin panel column takes the host's actions, or null when the right one is shut.

@@ -16,106 +16,29 @@ import kotlinx.serialization.json.JsonPrimitive
  * or shell command is both longer than 20 characters and the thing an operator most needs
  * to read before approving a mutating tool call. A value is only masked here when its key
  * names it as sensitive, or its shape is unambiguously a credential (JWT, GitHub token,
- * sk_/pk_ vendor key) - never on length alone.
+ * sk_/pk_ vendor key, Supabase sb_publishable_/sb_secret_ key) - never on length alone.
  */
 object McpArgumentSanitizer {
     private val sensitiveKeyWords =
         setOf("token", "password", "secret", "api_key", "apikey", "key", "credential")
 
-    /** Same credential shapes [LogSanitizer] recognizes: a JWT, a GitHub token, or a vendor sk_/pk_ key. */
+    /**
+     * Same credential shapes [LogSanitizer] recognizes: a JWT, a GitHub token, a vendor sk_/pk_
+     * key, or a Supabase `sb_publishable_`/`sb_secret_` key.
+     *
+     * This is a copy, and `McpArgumentSanitizerCredentialShapeTest` pins it against the original:
+     * an operator approving a tool call and a reader of the log must be shown the same redactions,
+     * and the two files are far enough apart that widening one alone is the likely mistake.
+     */
     private val credentialShapePattern =
         Regex(
             "(?<![A-Za-z0-9_.])(?:" +
                 """eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*""" +
                 "|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}" +
                 "|(?:sk|pk)[-_][A-Za-z0-9_-]{8,}" +
+                "|sb_(?:publishable|secret)_[A-Za-z0-9_-]{8,}" +
                 ")",
         )
-
-    /**
-     * AWS access key IDs: `AKIA` (IAM users) and `ASIA` (temporary) plus 16 uppercase
-     * alphanumerics. The other ID prefixes (`AROA`, `AIDA`, ...) and the 40-char base64 secret
-     * access key are deliberately not matched: the secret shape is too false-positive-prone to
-     * mask blindly, and key names like `aws_secret_access_key` in a map are caught by the
-     * key-name rules instead.
-     */
-    private val awsKeyPattern = Regex("""\b(?:AKIA|ASIA)[0-9A-Z]{16}\b""")
-
-    /**
-     * A PEM private key: the full BEGIN..END block when present, otherwise the header through the
-     * end of the line (a truncated fragment is still the secret). The body, not the header, is
-     * what makes this material dangerous, so the whole match is replaced. GPG armor ends the
-     * marker with ` BLOCK` (`-----BEGIN PGP PRIVATE KEY BLOCK-----`), so both markers allow an
-     * optional trailing ` BLOCK`. With `(?s)`, a truncated BEGIN scans lazily to the nearest
-     * later END anywhere in the string - deliberately over-masking, since the span between two
-     * key fragments is more likely to be secret than prose.
-     */
-    private val pemPrivateKeyPattern =
-        Regex(
-            """(?s)-----BEGIN (?:[A-Z0-9-]+ )?PRIVATE KEY(?: BLOCK)?-----""" +
-                """(?:.*?-----END (?:[A-Z0-9-]+ )?PRIVATE KEY(?: BLOCK)?-----|[^\n]*)""",
-        )
-
-    /**
-     * `curl -u user:secret` and the equivalent spellings: `-u` takes a separated or an attached
-     * argument, `--user` and `--proxy-user` a separated or `=` argument, so `--user=alice:pass`,
-     * `-ualice:pass` and `--proxy-user=alice:pass` are caught as well. (`-u` is case-insensitive,
-     * so the short proxy-user flag `-U` is masked the same way; the long `--proxy-user` spelling
-     * is in the alternation on its own because the lookbehind blocks a match on the `-u` inside
-     * it.) The credential follows a flag, not a key name, so the key-name rules never see it.
-     * The username may contain `@` (email usernames are the ordinary shape for SaaS basic auth)
-     * but not `/`, `:`, quotes or whitespace; everything after the first colon is the password
-     * and is masked whole - a password may itself contain `:` or `@`, and a QUOTED password may
-     * contain a space (the same three-branch quoted-value alternation the authorization rule
-     * above uses, so `curl -u 'admin:hun ter'` does not leave a tail). The password must not
-     * start with `/` or `\`, which keeps a bare URL argument (`-u http://host`) and an rsync
-     * remote spec (`-u host:/srv/data`) readable - a file-copy destination is exactly the thing
-     * an operator needs to see before approving. The separator is a space/tab, an optional line
-     * continuation (a trailing `\` + newline, the ordinary multi-line curl shape), or `=` -
-     * never a bare `\s`, so the rule cannot wander into an unrelated next line (the same
-     * convention the authorization rule above pins), and the matched separator is echoed back
-     * so the sanitized text stays a faithful rendering of the command being approved.
-     *
-     * Deliberately different from the URI rule: the URI userinfo goes whole
-     * (postgres://[REDACTED]@host) while the username is kept here
-     * (-u admin:[REDACTED]), because the operator judging WHICH account a curl call
-     * authenticates as is the exact information this dialog is for. Do not 'fix' one to
-     * match the other.
-     *
-     * Known over-masks (fail-closed, no leak): a `user:port`-shaped value after `-u` on a
-     * non-curl tool is masked too - `docker run -u 1000:1000 img` hides which uid the container
-     * runs as, and a RELATIVE rsync remote spec (`-u host:srv/data`) is masked where an
-     * absolute one is not. That is deliberate: the dialog's job is to hide credentials, and a
-     * `user:pass` after `-u` is indistinguishable from one here. Also known, out of scope:
-     * `mysql -uroot -pSecret` passes the password through, because `-p` is a port flag on half
-     * the tools that have a `-p`.
-     */
-    private val basicAuthFlagPattern =
-        Regex(
-            """(?i)(?<![A-Za-z0-9_-])""" +
-                """(-u(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=[ \t]*|(?=[^\s:=]))|--(?:proxy-)?user(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=))""" +
-                """("[^"]*"|'[^']*'|[^\s]+)""",
-        )
-
-    private fun redactBasicAuthFlag(match: MatchResult): String {
-        val credential = match.groupValues[2]
-        val quote = credential.firstOrNull()?.takeIf { it == '\'' || it == '"' }
-        val value =
-            if (quote != null && credential.length >= 2 && credential.last() == quote) {
-                credential.substring(1, credential.lastIndex)
-            } else {
-                credential
-            }
-        val colon = value.indexOf(':')
-        if (colon <= 0) return match.value
-        val username = value.substring(0, colon)
-        val password = value.substring(colon + 1)
-        if (username.any { it.isWhitespace() || it in "/\\'\"" } || password.startsWith('/') || password.startsWith('\\')) {
-            return match.value
-        }
-        val wrapper = quote?.toString().orEmpty()
-        return "${match.groupValues[1]}$wrapper$username:[REDACTED]$wrapper"
-    }
 
     /** Parse only for audit/approval; malformed input must never reach those surfaces verbatim. */
     @Suppress("TooGenericExceptionCaught") // Invalid nested JSON must not enter the audit surface verbatim.
@@ -123,6 +46,11 @@ object McpArgumentSanitizer {
         try {
             if (raw.length > 16_384) {
                 mapOf("arguments" to "[OMITTED: too large]")
+            } else if (mcpJsonNestingExceeds(raw)) {
+                // Before the parse, not after: the parser's own recursion overflows on deep
+                // nesting, and a StackOverflowError is not an Exception - it would escape invoke's
+                // finally and lose the ledger row this map is built for.
+                mapOf("arguments" to "[OMITTED: too deeply nested]")
             } else {
                 (Json.parseToJsonElement(raw) as? JsonObject)?.toMap()
                     ?: mapOf("arguments" to "[OMITTED: invalid JSON object]")
@@ -180,35 +108,167 @@ object McpArgumentSanitizer {
             }
         }
 
+    /**
+     * What may sit between a sensitive name and its `:` or `=`: the closing quote of a JSON or
+     * YAML key, possibly JSON-escaped when the whole object travels inside a string
+     * (`{\"password\":\"x\"}` is what `curl -d` carries in a tool argument).
+     */
+    private const val KEY_CLOSE = """(?:\\?["'])?"""
+
+    /** A value: quoted whole, or up to the next delimiter. The closing quote of a JSON value rides along. */
+    private const val VALUE = """(?:"[^"]*"|'[^']*'|[^\s&,;}]+)"""
+
     /** Authorization is special: consume generic scheme words before the credential value. */
     private val authorizationHeader =
         Regex(
-            """(?i)authorization[ \t]*[:=][ \t]*""" +
-                """(?:[A-Za-z][A-Za-z0-9._~+/-]*[ \t]+){0,3}(?:"[^"]*"|'[^']*'|[^\s&,;}]+)""",
+            """(?i)authorization$KEY_CLOSE[ \t]*[:=][ \t]*$KEY_CLOSE""" +
+                """(?:[A-Za-z][A-Za-z0-9._~+/-]*[ \t]+){0,3}$VALUE""",
         )
 
+    /**
+     * `password=`, `token:`, and every name built on those words with `_` or `-`
+     * (`AWS_SECRET_ACCESS_KEY`, `SECRET_KEY_BASE`, `password_confirmation`, `client-secret`), as an
+     * assignment or a quoted key. A `Cookie:` header is a credential too: its value is the session.
+     * Only whole words joined by `_`/`-` extend a name, on purpose:
+     * `max_tokens=4096` and `--tokenizer=bert` are things an operator reads in this product every
+     * day, and `tokens` is not `token`.
+     *
+     * Two guards keep a secret REFERENCE (`{{secret:<id>}}`) legible, because it is inert by
+     * construction - it names a vault entry and carries no value - and a ledger showing
+     * `{{[REDACTED]}}` or `TOKEN=[REDACTED]}}` where the agent wrote a reference would hide the
+     * one fact that record exists to show: which secret the call was allowed to receive.
+     * - The lookbehind: `secret:` is itself an assignment prefix, and a reference is exactly that
+     *   shape, so a reference is not treated as a `secret: value` assignment.
+     * - The lookahead: `TOKEN={{secret:<id>}}` is a `token=` assignment whose VALUE is a
+     *   reference; the value is kept. Nothing real starts with `{{secret:`.
+     * See `ai.rever.boss.mcp.secrets`.
+     */
+    private const val validSecretReference =
+        """\{\{secret:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}""" +
+            """(?:\.(?:password|username|notes))?\}\}"""
     private val sensitiveAssignment =
         Regex(
-            """(?i)(?:password|token|secret|api[_-]?key|credential)""" +
-                """\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s&,;}]+)""",
+            """(?i)(?:(?:password|passwd|token|api[_-]?key|credential|cookie)|(?<!\{\{)secret)""" +
+                """(?:[_-][A-Za-z0-9]+)*$KEY_CLOSE\s*[:=]\s*(?!$validSecretReference(?:[\s&,;}]|$))$VALUE""",
         )
     private val bearer = Regex("""(?i)Bearer\s+[^\s"',;}]+""")
 
+    /**
+     * A credential given to a command-line client as a flag value with a space, where no `=` or
+     * `:` marks the assignment: `mysql --password x`, `vault login --token x`, `docker login
+     * --password x`. Long flags carry their meaning in their name, so this is safe for every
+     * program. The short `-p` is not (`mkdir -p build`, `docker run -p 8080:80`, `ssh -p 2222`),
+     * so it is recognised only after the programs whose `-p` IS a password (`sshpass`, `mysql`
+     * and its tools, `mongo`, `docker login`, `az login`), and `-a` only after `redis-cli`.
+     */
+    private val longSecretFlag =
+        Regex(
+            """(?<![A-Za-z0-9_-])--(?:password|passwd|pass|token|api[-_]?key|secret|client[-_]secret|""" +
+                """access[-_]token|auth[-_]?token)[ \t]+(?!-)$VALUE""",
+        )
+    private val shortSecretFlag =
+        Regex(
+            """(?<![A-Za-z0-9_-])((?:sshpass|mysql\w*|mongo(?:sh)?|docker[ \t]+login|az[ \t]+login)\b""" +
+                """[^\n;&|]*?[ \t]-p)[ \t]*(?!-)$VALUE""",
+        )
+    private val redisAuthFlag = Regex("""(?<![A-Za-z0-9_-])(redis-cli\b[^\n;&|]*?[ \t]-a)[ \t]+(?!-)$VALUE""")
+
+    /** npm's registry token line: `//registry.npmjs.org/:_authToken x` (also written with `=`). */
+    private val npmAuthToken = Regex("""(?i)(_auth[_-]?token)[ \t]*[:= ][ \t]*$VALUE""")
+
+    /** A purely numeric `uid:gid`, which `-u`/`--user` takes in docker and podman; see [basicAuthFlag]. */
+    private const val uidGidValue = """[0-9]+:[0-9]*(?=[\s&,;}"']|$)"""
+
+    /**
+     * A credential handed to a command-line client as basic auth, `curl -u admin:hunter2` or
+     * `--user admin:hunter2`. The value has no sensitive key, is not an assignment and has no
+     * vendor prefix, so nothing above sees it. The value must carry the `user:password` colon:
+     * `-u` is also `git push -u origin` and `python -u`, and an operator has to be able to read
+     * those. A URL after `-u` (`redis-cli -u redis://...`) is not basic auth either: its userinfo
+     * was redacted by the pass before this one and its host must stay readable.
+     *
+     * A purely numeric `uid:gid` is not basic auth either: `docker run -u 1000:1000` and
+     * `podman run --user=0:0` are among the commonest invocations there are, and which uid a
+     * container is about to run as is exactly the kind of thing approval exists to show. No
+     * credential is two integers, so the exclusion costs nothing; a numeric password with a
+     * non-numeric user (`-u admin:1234`) still redacts, because only both sides being integers
+     * makes it a uid pair.
+     *
+     * The short flag also accepts an attached credential; the long user and proxy-user flags
+     * accept a space or equals sign. A backslash plus newline is one separator, while a bare
+     * newline is not. Quoted credentials match whole, including spaces in the password, and a
+     * remote-path value beginning with a slash or backslash after the colon stays readable.
+     */
+    private val basicAuthFlag =
+        Regex(
+            """(?i)(?<![A-Za-z0-9_-])""" +
+                """(-u(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=|(?=["']?[^ \t\r\n:=/'"\\]+:))|--(?:proxy-)?user(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=))""" +
+                """(?!["']?[A-Za-z][A-Za-z0-9+.-]*://)(?!["']?$uidGidValue)""" +
+                """(?!["']?[^ \t\r\n:=/'"\\]+:[/\\])""" +
+                """(?:"[^"]*:[^"]*"|'[^']*:[^']*'|[^\s&,;}"']+:[^\s&,;}"']*)""",
+        )
+
+    /**
+     * The cookie jar given as a flag rather than as a header: `curl -b 'session=x'`,
+     * `curl --cookie "session=x"`. `sensitiveAssignment` closes `Cookie: session=x` because the
+     * word `cookie` sits directly before the separator, and closes nothing here: after the flag the
+     * cookie's name is whatever the site chose (`session`, `sid`, `JSESSIONID`), so the flag is the
+     * signal and the whole value is taken.
+     *
+     * The short `-b` is gated on `curl`, exactly as [shortSecretFlag] gates `-p`: elsewhere `-b` is
+     * a branch (`git checkout -b feature/x`), a bind address (`ssh -b`), a block size (`tar -b 20`),
+     * a build file (`gradle -b`), or takes no value at all (`cp -b`, `grep -b`, `wget -b`), and an
+     * ungated rule would redact the branch name or eat the next positional. The long spellings
+     * carry their meaning in their name and are unconditional, like [longSecretFlag]. `-b` after
+     * curl also names a jar file, which is redacted too: telling a path from cookies needs a
+     * filesystem the sanitizer does not have.
+     */
+    private val cookieShortFlag = Regex("""(?<![A-Za-z0-9_-])(curl\b[^\n;&|]*?[ \t]-b)[ \t]+(?!-)$VALUE""")
+    private val cookieLongFlag = Regex("""(?<![A-Za-z0-9_-])(--cookie(?:-jar)?)(?:[ \t]+|=)(?!-)$VALUE""")
+
+    /**
+     * Shapes the issue measured leaking that the vendor-prefix rule above does not cover: an AWS
+     * access key id (`AKIA` or `ASIA` plus 16 upper-case alphanumerics, the documented format) and
+     * a PEM private-key block, whose base64 body follows the BEGIN line.
+     * PGP private-key armor adds BLOCK after PRIVATE KEY in both markers.
+     */
+    private val awsAccessKeyId = Regex("""(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])""")
+    private val pemPrivateKey =
+        Regex(
+                """-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----""" +
+                // RFC 1421 headers (Proc-Type:, DEK-Info:) sit between the BEGIN line and the
+                // base64 in a traditionally encrypted PEM, and they contain '-' - which the body
+                // class excludes. Without this arm the match stops at the headers and the whole
+                // encrypted key body (openssl rsa -aes256, ssh-keygen -m PEM with a passphrase)
+                // survives into the dialog and the ledger. Header lines tolerate a real newline
+                // or the escaped `\n` they carry when the whole command travels inside a JSON
+                // string: without that the arm starves on the '\' and the encrypted body
+                // survives again (fuzz cell: encrypted pem block / json string value).
+                """(?:(?:\s|\\n)*[A-Za-z-]+:(?:\\(?!n)|[^\n\\])*(?:\n|\\n))*[A-Za-z0-9+/=\s\\]*""" +
+                """(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----)?""",
+        )
+
+    /**
+     * Ordered so each rule sees the text the ones before it produced. The URI userinfo pass runs
+     * first: `postgres://admin:hunter2@host` is the commonest way a real credential reaches a
+     * terminal command, and it is neither an assignment nor a known shape. #640 added the helper
+     * for the logging path; the MCP path is where the same value reaches the approval dialog and
+     * the ledger on disk (#886).
+     */
     fun sanitizeMessage(text: String): String =
-        text
-            // URI authority userinfo is redacted by the shared #640 helper: the authority ends at
-            // the first `/`, `?` or `#` and the LAST `@` is the delimiter, so a password
-            // containing an `@` is removed whole (a local regex left its tail in the output).
-            // Known inherited limitation, accepted for this consent surface as for logs: a
-            // backslash does not end the authority (WHATWG), so
-            // `https://evil.example\@good.example/x` renders as
-            // `https://[REDACTED]@good.example/x`, hiding the host that was actually reached.
-            .let(LogSanitizer::redactUrlUserInfo)
+        LogSanitizer
+            .redactUrlUserInfo(text)
+            .replace(pemPrivateKey, "[REDACTED]")
+            .replace(awsAccessKeyId, "[REDACTED]")
+            .replace(basicAuthFlag, "$1[REDACTED]")
+            .replace(cookieShortFlag, "$1 [REDACTED]")
+            .replace(cookieLongFlag, "$1 [REDACTED]")
             .replace(credentialShapePattern, "[REDACTED]")
-            .replace(awsKeyPattern, "[REDACTED]")
-            .replace(pemPrivateKeyPattern, "[REDACTED]")
             .replace(sensitiveAssignment, "[REDACTED]")
             .replace(authorizationHeader, "[REDACTED]")
+            .replace(longSecretFlag, "[REDACTED]")
+            .replace(shortSecretFlag, "$1 [REDACTED]")
+            .replace(redisAuthFlag, "$1 [REDACTED]")
+            .replace(npmAuthToken, "$1 [REDACTED]")
             .replace(bearer, "Bearer [REDACTED]")
-            .replace(basicAuthFlagPattern, ::redactBasicAuthFlag)
 }
