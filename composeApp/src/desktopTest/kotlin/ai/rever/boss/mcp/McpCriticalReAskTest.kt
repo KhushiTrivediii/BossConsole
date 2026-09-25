@@ -10,6 +10,7 @@ import ai.rever.boss.plugin.api.McpToolResult
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -150,7 +151,7 @@ class McpCriticalReAskTest {
 
             // The escalation IS the prompt: no operator answer yet, so the call must be suspended
             // on the bus, and the request must carry the CRITICAL assessment that triggered it.
-            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            val request = withTimeout(5000L) { approvalBus.pendingList.first { it.isNotEmpty() }.first() }
             assertEquals("run_command", request.toolName)
             assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
 
@@ -224,7 +225,7 @@ class McpCriticalReAskTest {
 
             val call = async { core.invoke("run_command", """{"command":"git push --force"}""") }
 
-            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            val request = withTimeout(5000L) { approvalBus.pendingList.first { it.isNotEmpty() }.first() }
             assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
             approvalBus.deny(request.id, "denied by test")
 
@@ -265,7 +266,7 @@ class McpCriticalReAskTest {
 
             val call = async { core.invoke("run_command", """{"command":"mkfs.ext4 /dev/sda1"}""") }
 
-            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            val request = withTimeout(5000L) { approvalBus.pendingList.first { it.isNotEmpty() }.first() }
             assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
             approvalBus.deny(request.id, "denied by test")
 
@@ -309,7 +310,7 @@ class McpCriticalReAskTest {
             // Even with no args, secret_get is CRITICAL → must escalate to ASK
             val call = async { core.invoke("secret_get", "{}") }
 
-            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            val request = withTimeout(5000L) { approvalBus.pendingList.first { it.isNotEmpty() }.first() }
             assertEquals(McpRiskLevel.CRITICAL, request.riskAssessment?.level)
             approvalBus.deny(request.id, "denied by test")
 
@@ -356,7 +357,7 @@ class McpCriticalReAskTest {
             )
 
             val call = async { core.invoke("run_command", """{"command":"rm -rf /"}""") }
-            val request = approvalBus.pendingList.first { it.isNotEmpty() }.first()
+            val request = withTimeout(5000L) { approvalBus.pendingList.first { it.isNotEmpty() }.first() }
             approvalBus.approve(request.id)
 
             // The escalation gates the call, it does not kill it: an explicit operator
