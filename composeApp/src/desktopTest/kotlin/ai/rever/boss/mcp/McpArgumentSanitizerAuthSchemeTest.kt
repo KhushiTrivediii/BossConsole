@@ -179,9 +179,56 @@ class McpArgumentSanitizerAuthSchemeTest {
         val rsync = McpArgumentSanitizer.sanitizeMessage("rsync -u host:/srv/data /tmp")
         assertEquals("rsync -u host:/srv/data /tmp", rsync)
 
-        // The rule must not cross a newline (same [ \t] convention the authorization rule pins)
+        // A bare newline is NOT a separator (same [ \t] convention the authorization rule pins).
+        // Known leak, kept on purpose: this pins that the rule cannot wander into an unrelated
+        // next line, and the unmasked admin:hunter2 is written to the ledger in plaintext - the
+        // price of not crossing newlines. The common multi-line curl shape (line continuation)
+        // IS masked; see the continuation test below.
         val newline = McpArgumentSanitizer.sanitizeMessage("curl -u\nadmin:hunter2 https://x")
         assertEquals("curl -u\nadmin:hunter2 https://x", newline)
+
+        // A quoted password with a space is masked whole: the bare [^\s]* used to stop at the
+        // space and leave the tail readable (the same bug the quoted-credential test above pins
+        // for the authorization rule).
+        val quotedPass = McpArgumentSanitizer.sanitizeMessage("curl -u 'admin:hun ter' https://x")
+        assertFalse(quotedPass.contains("hun"), "single-quoted password leaked: $quotedPass")
+        assertFalse(quotedPass.contains("ter"), "single-quoted password tail leaked: $quotedPass")
+        assertTrue(quotedPass.contains("[REDACTED]"), quotedPass)
+
+        val quotedPassDouble = McpArgumentSanitizer.sanitizeMessage("curl -u \"admin:hun ter\" https://x")
+        assertFalse(quotedPassDouble.contains("hun"), "double-quoted password leaked: $quotedPassDouble")
+        assertFalse(quotedPassDouble.contains("ter"), "double-quoted password tail leaked: $quotedPassDouble")
+        assertTrue(quotedPassDouble.contains("[REDACTED]"), quotedPassDouble)
+
+        // --proxy-user: one flag, two spellings, both masked (the short -U form was already
+        // matched by the case-insensitive -u branch; the long spelling needs its own entry).
+        val proxyLong = McpArgumentSanitizer.sanitizeMessage("curl --proxy-user admin:hunter2 https://x")
+        assertEquals("curl --proxy-user admin:[REDACTED] https://x", proxyLong)
+
+        val proxyLongEq = McpArgumentSanitizer.sanitizeMessage("curl --proxy-user=admin:hunter2 https://x")
+        assertEquals("curl --proxy-user=admin:[REDACTED] https://x", proxyLongEq)
+
+        val proxyShort = McpArgumentSanitizer.sanitizeMessage("curl -U admin:hunter2 https://x")
+        assertEquals("curl -U admin:[REDACTED] https://x", proxyShort)
+    }
+
+    @Test
+    fun `a line continuation between the user flag and its credential is redacted too`() {
+        // The ordinary multi-line curl shape: a trailing backslash + newline is an unambiguous
+        // continuation, so the separator alternative may cross exactly that - and nothing else.
+        val continued = McpArgumentSanitizer.sanitizeMessage("curl -u \\\n  admin:hunter2 https://x")
+        assertEquals("curl -u \\\n  admin:[REDACTED] https://x", continued)
+
+        val continuedAttached = McpArgumentSanitizer.sanitizeMessage("curl -u\\\nadmin:hunter2 https://x")
+        assertEquals("curl -u\\\nadmin:[REDACTED] https://x", continuedAttached)
+
+        val continuedCrlf = McpArgumentSanitizer.sanitizeMessage("curl -u \\\n  admin:hunter2 https://x")
+        assertEquals("curl -u \\\n  admin:[REDACTED] https://x", continuedCrlf)
+
+        // But a bare newline (no backslash) still does not cross - the rule cannot wander
+        // into an unrelated next line.
+        val bareNewline = McpArgumentSanitizer.sanitizeMessage("curl -u\nadmin:hunter2 https://x")
+        assertEquals("curl -u\nadmin:hunter2 https://x", bareNewline)
     }
 
     @Test

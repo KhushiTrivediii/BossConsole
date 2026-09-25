@@ -58,30 +58,64 @@ object McpArgumentSanitizer {
 
     /**
      * `curl -u user:secret` and the equivalent spellings: `-u` takes a separated or an attached
-     * argument, `--user` a separated or `=` argument, so `--user=alice:pass` and `-ualice:pass`
-     * are caught as well. The credential follows a flag, not a key name, so the key-name rules
-     * never see it. The username may contain `@` (email usernames are the ordinary shape for
-     * SaaS basic auth) but not `/`, `:` or whitespace; everything after the first colon is the
-     * password and is masked whole (a password may itself contain `:` or `@`). The password must
-     * not start with `/` or `\`, which keeps a bare URL argument (`-u http://host`) and an
-     * rsync remote spec (`-u host:/srv/data`) readable - a file-copy destination is exactly the
-     * thing an operator needs to see before approving. The separator is `[ \t]`, never `\s`,
-     * so the rule cannot cross a newline (the same convention the authorization rule above
-     * pins), and the matched separator is echoed back so the sanitized text stays a faithful
-     * rendering of the command being approved.
+     * argument, `--user` and `--proxy-user` a separated or `=` argument, so `--user=alice:pass`,
+     * `-ualice:pass` and `--proxy-user=alice:pass` are caught as well. (`-u` is case-insensitive,
+     * so the short proxy-user flag `-U` is masked the same way; the long `--proxy-user` spelling
+     * is in the alternation on its own because the lookbehind blocks a match on the `-u` inside
+     * it.) The credential follows a flag, not a key name, so the key-name rules never see it.
+     * The username may contain `@` (email usernames are the ordinary shape for SaaS basic auth)
+     * but not `/`, `:`, quotes or whitespace; everything after the first colon is the password
+     * and is masked whole - a password may itself contain `:` or `@`, and a QUOTED password may
+     * contain a space (the same three-branch quoted-value alternation the authorization rule
+     * above uses, so `curl -u 'admin:hun ter'` does not leave a tail). The password must not
+     * start with `/` or `\`, which keeps a bare URL argument (`-u http://host`) and an rsync
+     * remote spec (`-u host:/srv/data`) readable - a file-copy destination is exactly the thing
+     * an operator needs to see before approving. The separator is a space/tab, an optional line
+     * continuation (a trailing `\` + newline, the ordinary multi-line curl shape), or `=` -
+     * never a bare `\s`, so the rule cannot wander into an unrelated next line (the same
+     * convention the authorization rule above pins), and the matched separator is echoed back
+     * so the sanitized text stays a faithful rendering of the command being approved.
      *
      * Deliberately different from the URI rule: the URI userinfo goes whole
      * (postgres://[REDACTED]@host) while the username is kept here
      * (-u admin:[REDACTED]), because the operator judging WHICH account a curl call
      * authenticates as is the exact information this dialog is for. Do not 'fix' one to
      * match the other.
+     *
+     * Known over-masks (fail-closed, no leak): a `user:port`-shaped value after `-u` on a
+     * non-curl tool is masked too - `docker run -u 1000:1000 img` hides which uid the container
+     * runs as, and a RELATIVE rsync remote spec (`-u host:srv/data`) is masked where an
+     * absolute one is not. That is deliberate: the dialog's job is to hide credentials, and a
+     * `user:pass` after `-u` is indistinguishable from one here. Also known, out of scope:
+     * `mysql -uroot -pSecret` passes the password through, because `-p` is a port flag on half
+     * the tools that have a `-p`.
      */
     private val basicAuthFlagPattern =
         Regex(
             """(?i)(?<![A-Za-z0-9_-])""" +
-                """(-u(?:[ \t]+|=[ \t]*|(?=[^\s:=]))?|--user(?:[ \t]+|=))""" +
-                """([^\s:=/]+):(?![/\\])(?:[^\s]*)""",
+                """(-u(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=[ \t]*|(?=[^\s:=]))|--(?:proxy-)?user(?:[ \t]*\\\r?\n[ \t]*|[ \t]+|=))""" +
+                """("[^"]*"|'[^']*'|[^\s]+)""",
         )
+
+    private fun redactBasicAuthFlag(match: MatchResult): String {
+        val credential = match.groupValues[2]
+        val quote = credential.firstOrNull()?.takeIf { it == '\'' || it == '"' }
+        val value =
+            if (quote != null && credential.length >= 2 && credential.last() == quote) {
+                credential.substring(1, credential.lastIndex)
+            } else {
+                credential
+            }
+        val colon = value.indexOf(':')
+        if (colon <= 0) return match.value
+        val username = value.substring(0, colon)
+        val password = value.substring(colon + 1)
+        if (username.any { it.isWhitespace() || it in "/\\'\"" } || password.startsWith('/') || password.startsWith('\\')) {
+            return match.value
+        }
+        val wrapper = quote?.toString().orEmpty()
+        return "${match.groupValues[1]}$wrapper$username:[REDACTED]$wrapper"
+    }
 
     /** Parse only for audit/approval; malformed input must never reach those surfaces verbatim. */
     @Suppress("TooGenericExceptionCaught") // Invalid nested JSON must not enter the audit surface verbatim.
@@ -176,5 +210,5 @@ object McpArgumentSanitizer {
             .replace(sensitiveAssignment, "[REDACTED]")
             .replace(authorizationHeader, "[REDACTED]")
             .replace(bearer, "Bearer [REDACTED]")
-            .replace(basicAuthFlagPattern, "$1$2:[REDACTED]")
+            .replace(basicAuthFlagPattern, ::redactBasicAuthFlag)
 }
