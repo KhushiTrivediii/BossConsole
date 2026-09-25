@@ -156,7 +156,12 @@ class McpDestructiveShellAllowTest {
             approvalBus.approve(request.id)
             assertFalse(pending.await().isError)
             assertEquals(1, handlerRuns)
-            assertEquals(McpPolicyAction.ASK, ledger.recentOperations.value.first().policyApplied)
+            assertEquals(
+                McpPolicyAction.ASK,
+                ledger.recentOperations.value
+                    .first()
+                    .policyApplied,
+            )
         }
 
     // #1624: the prompt marks itself escalated so the dialog can offer only a one-off answer, and
